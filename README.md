@@ -4,6 +4,10 @@
 
 A [UE4SS](https://github.com/UE4SS-RE/RE-UE4SS) Lua mod exposes the live game over a pair of append-only files. A Python driver on the other side reads and writes UObject properties, calls UFunctions, and — the part that matters — refuses to report success it cannot prove.
 
+It speaks MCP, so an agent can drive the game directly — and the write tool
+returns a verdict rather than a boolean, so an agent cannot report a state
+change it did not make.
+
 No engine source, no game source, no C++, no sockets.
 
 ```
@@ -61,13 +65,18 @@ Two rules came out of that, and they are the whole design now:
 
 ## Verdicts
 
-| Verdict | Meaning | Exit |
-|---|---|---|
-| `Chain verified end to end` | Both channels agree, and the check was proven capable of failing | 0 |
-| `FALSE SUCCESS caught` | The bridge claimed a write it did not make; both channels agree | 1 |
-| `INCONSISTENT BRIDGE` | Write site and re-read disagree; no verdict is available | 1 |
-| `VERDICT WITHHELD` | The poison never applied, so the apparent pass is unproven | 1 |
-| `DEAD CHECK` | The check survived a poison that provably landed | 1 |
+The CLI and the MCP tool report the same five outcomes.
+
+| MCP `verdict` | CLI line | Meaning | Exit |
+|---|---|---|---|
+| `CONFIRMED` | Chain verified end to end | Both channels agree, and the check was proven capable of failing | 0 |
+| `FALSE_SUCCESS` | FALSE SUCCESS caught | The bridge claimed a write it did not make; both channels agree | 1 |
+| `INCONSISTENT_BRIDGE` | INCONSISTENT BRIDGE | Write site and re-read disagree; no verdict is available | 1 |
+| `WITHHELD` | VERDICT WITHHELD | The poison never applied, so the apparent pass is unproven | 1 |
+| `DEAD_CHECK` | DEAD CHECK | The check survived a poison that provably landed | 1 |
+
+Only the first is a success. The other four are distinct facts, and collapsing
+them into "failed" throws away the part that tells you what to do next.
 
 ## Install
 
@@ -89,12 +98,38 @@ python drive.py --data "<game>/.../Mods/GameBridge/data" probe BP_PlayerCharacte
 
 Blueprint classes take the `_C` suffix — `BP_ChangeManager_C`, not `BP_ChangeManager`.
 
+## Use it from an agent (MCP)
+
+```bash
+pip install "mcp>=2"
+claude mcp add ue-live -- python /abs/path/mcp_server.py --data "/abs/path/to/GameBridge/data"
+```
+
+Five tools: `ping`, `find_objects`, `read_property`, `call_function`, `write_property`.
+
+`write_property` is the one that matters. It never returns a bare boolean; it
+returns one of the verdicts below, and the server's instructions tell the client
+to treat anything other than `CONFIRMED` as the write not having happened —
+including `WITHHELD`, because *unproven* is not *succeeded*.
+
+```json
+{
+  "verdict": "CONFIRMED",
+  "detail": "independently observed, and the check was proven able to fail",
+  "value": 21.0,
+  "original": 36
+}
+```
+
+That transcript is from The Exit 8, through the MCP tool, against the running game.
+
 ## Tests
 
 The verification logic runs off-engine, against a simulated game that can be told to lie:
 
 ```bash
 python test/spike_test.py                              # 4 scenarios, no game needed
+python test/mcp_test.py                                # MCP verdicts, all three bridges
 python test/fake_bridge.py --data ./_t --lie           # then: python drive.py --data ./_t probe
 ```
 
@@ -119,7 +154,8 @@ Each of these was paid for:
 - `ping` / `find` / `read` / `write` / `call` against live objects
 - Round trip ~200 ms including Python process startup
 - Negative control confirmed alive; game state restored afterwards
-- Off-engine: 4/4 scenarios, including the two adversarial ones
+- MCP tools end to end against the live game; `write_property` returned CONFIRMED
+- Off-engine: 4/4 spike scenarios and 3/3 MCP verdicts, including the adversarial ones
 
 **Not verified:**
 
