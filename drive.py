@@ -177,7 +177,7 @@ def probe(b: FileBridge, cls: str, prop: str) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", required=True, help="GameBridge data directory")
-    ap.add_argument("cmd", choices=["ping", "find", "read", "probe"])
+    ap.add_argument("cmd", choices=["ping", "find", "read", "probe", "bench"])
     ap.add_argument("arg", nargs="?", default="BP_PlayerCharacter_C")
     ap.add_argument("--prop", default="Health")
     a = ap.parse_args()
@@ -189,6 +189,9 @@ def main() -> int:
         print(json.dumps(b.send(op="find", **{"class": a.arg}, limit=25), indent=1))
     elif a.cmd == "read":
         print(b.read(a.arg, a.prop))
+    elif a.cmd == "bench":
+        r = b.send(op="bench", rounds=5)
+        print(json.dumps(r, indent=1))
     else:
         return probe(b, a.arg, a.prop)
     return 0

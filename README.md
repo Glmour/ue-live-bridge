@@ -94,6 +94,7 @@ Then, with the game running and in a level:
 python drive.py --data "<game>/.../Mods/GameBridge/data" ping
 python drive.py --data "<game>/.../Mods/GameBridge/data" find BP_PlayerCharacter_C
 python drive.py --data "<game>/.../Mods/GameBridge/data" probe BP_PlayerCharacter_C --prop Health
+python drive.py --data "<game>/.../Mods/GameBridge/data" bench    # what a cache miss costs here
 ```
 
 Blueprint classes take the `_C` suffix — `BP_ChangeManager_C`, not `BP_ChangeManager`.
@@ -135,12 +136,32 @@ python test/fake_bridge.py --data ./_t --lie           # then: python drive.py -
 
 `fake_bridge.py` reproduces both failure modes on demand (`--lie`, `--deadcheck`), which is how the design flaw above was found and how the fix was confirmed.
 
+
+## What a cache miss actually costs
+
+`bench` searches for a name that cannot exist, which forces the complete worst-case sweep.
+
+| Game | State | UObjects | `FindAllOf("Object")` | Full scan | Per object |
+|---|---|---|---|---|---|
+| The Exit 8 (one corridor) | **in level** | 23,919 | 11 ms | 29.6 ms | 1.24 µs |
+| Escape the Backrooms (26 GB) | **main menu only** | 29,784 | 13 ms | 37.6 ms | 1.26 µs |
+
+Two things fall out of that, and the second is the one that changed the design.
+
+**Object count is dominated by the engine and loaded assets, not by world size.** A 26 GB game sitting on its *main menu*, with zero Characters spawned, carries 25% more UObjects than another title's fully loaded playable level. Do not reason about this cost from how big the map looks.
+
+**The cost is linear at ~1.25 µs per object, on the game thread.** That is 30 ms where it is cheapest, and it scales from there — roughly 125 ms at 100k objects, a quarter of a second at 200k. Every millisecond of it is a frame hitch.
+
+So the scan is off by default. Spending a visible stall is a decision the caller should make deliberately, not something the resolver does behind their back because a name was not in a table.
+
+*Caveat, since it changes what the second row proves: Escape the Backrooms was measured at its main menu, not in a level. It bounds the engine's baseline, not a loaded open world. The per-object figure is the number that transfers.*
+
 ## Design notes
 
 Each of these was paid for:
 
 - **The command file is never rewound.** A line cursor is set to the file's current length at load, so commands left over from a previous session are not replayed. Without this, whoever starts the game executes the leftovers — a stale write lands minutes after anyone asked for it, and the symptom looks nothing like the cause.
-- **`resolve` caches, and re-validates on every hit.** The engine recycles object slots, so a pointer that still passes `IsValid()` can belong to something else; the cached name is checked again before use. `find` populates the cache with objects it is already holding, so the normal find-then-act flow does no scanning at all — measured at **7 resolve hits, 0 full scans** across a complete probe run.
+- **`resolve` caches, re-validates on every hit, and refuses to scan by default.** The engine recycles object slots, so a pointer that still passes `IsValid()` can belong to something else; the cached name is checked again before use. `find` populates the cache from objects it is already holding, so the normal find-then-act flow does no scanning at all — measured at **7 resolve hits, 0 full scans** across a complete probe run. A cache miss returns an error telling you to call `find` first, rather than silently spending a frame hitch; `allow_scan=1` opts in. See the measurement below for why.
 - **The cache is dropped during travel.** Objects do not survive a level change, and a stale entry that happened to re-validate would hand back an object from the old world.
 - **Arrays are tagged.** An empty Lua table is ambiguous between `{}` and `[]`; without a tag an empty result set serialises as an object and breaks the reader's indexing.
 - **Every command runs inside `pcall`.** A malformed request must not take the poll loop down with it.
@@ -159,7 +180,7 @@ Each of these was paid for:
 
 **Not verified:**
 
-- **Large worlds.** The Exit 8 is one corridor with a single player and controller. The cache means the common path does no scanning, but a cache miss still falls back to a linear sweep of the whole object array, and that has never been measured on an open-world title.
+- **A genuinely large loaded world.** Both measurements above are bounded: one small game in a level, one large game at a menu. The linear per-object cost should hold, but no open world with a fully streamed-in level has been measured.
 - **Long sessions.** The longest run here is minutes, not hours.
 - **Level transitions.** The cache is dropped on travel by construction, but the behaviour has not been exercised across an actual transition.
 - **Engines other than 5.2.**

@@ -131,7 +131,7 @@ end
 --- A cached entry is re-validated on every use: the engine recycles object slots,
 --- so a pointer that is still "valid" can belong to something else entirely by
 --- the time you use it. Checking the name again is what makes the cache safe.
-local function resolve(name)
+local function resolve(name, allow_scan)
     local hit = CACHE[name]
     if hit and valid(hit) and fullName(hit) == name then
         STATS.resolve_hits = STATS.resolve_hits + 1
@@ -142,8 +142,23 @@ local function resolve(name)
         STATS.cache_evictions = STATS.cache_evictions + 1
     end
 
-    -- Fallback: a linear sweep of the whole object array. Fine on a small level,
-    -- expensive on a large one, which is why the cache exists.
+    -- Fallback: a linear sweep of the whole object array, on the game thread.
+    --
+    -- Measured at ~1.25 us per object, and object count is dominated by the
+    -- engine and loaded assets rather than by world size -- a one-corridor game
+    -- carries 23,919 objects and another title's *main menu* carries 29,784. So
+    -- this costs 30 ms where it is cheapest and scales linearly from there:
+    -- ~125 ms at 100k objects, all of it a frame hitch.
+    --
+    -- That is too expensive to spend implicitly. Off by default: the caller is
+    -- told to run `find` first, which populates the cache from objects it is
+    -- already holding and costs nothing extra. Pass allow_scan to opt in.
+    if not allow_scan then
+        return nil, "not cached; call find for this class first, or pass "
+                 .. "allow_scan=1 to accept a full object-array sweep "
+                 .. "(~1.25us/object on the game thread)"
+    end
+
     STATS.resolve_scans = STATS.resolve_scans + 1
     local found
     pcall(function()
@@ -210,9 +225,51 @@ function OPS.find(c)
     return { ok = true, count = n, objects = out }
 end
 
+--- Measure what a cache miss actually costs on this game.
+---
+--- `resolve` falls back to a linear sweep of the whole object array, calling
+--- GetFullName on each entry until it matches. That is cheap on a corridor and
+--- unknown on an open world, so measure it rather than guess: search for a name
+--- that cannot exist, which forces the complete worst-case traversal.
+function OPS.bench(c)
+    if travelling() then return { ok = false, err = "world is travelling" } end
+
+    local t0 = os.clock()
+    local all, n = nil, 0
+    pcall(function() all = FindAllOf("Object") end)
+    if all then n = #all end
+    local t_enum = os.clock() - t0
+
+    local rounds = math.min(tonumber(c.rounds) or 3, 10)
+    local worst, total = 0, 0
+    for _ = 1, rounds do
+        local t1 = os.clock()
+        pcall(function()
+            for i = 1, n do
+                if fullName(all[i]) == "\1no-such-object\1" then break end
+            end
+        end)
+        local dt = os.clock() - t1
+        total = total + dt
+        if dt > worst then worst = dt end
+    end
+
+    return {
+        ok = true,
+        objects = n,
+        enum_ms = math.floor(t_enum * 100000 + 0.5) / 100,
+        scan_avg_ms = math.floor((total / rounds) * 100000 + 0.5) / 100,
+        scan_worst_ms = math.floor(worst * 100000 + 0.5) / 100,
+        rounds = rounds,
+        cached = cacheSize(),
+    }
+end
+
 function OPS.read(c)
-    local o = resolve(c.obj)
-    if not valid(o) then return { ok = false, err = "object not found" } end
+    local o, why = resolve(c.obj, c.allow_scan)
+    if not valid(o) then
+        return { ok = false, err = why or "object not found" }
+    end
     local v, got
     local ok = pcall(function() v = o[c.prop]; got = true end)
     if not ok or not got then return { ok = false, err = "property read failed" } end
@@ -232,8 +289,10 @@ end
 --- bridge that can lie without being caught, and that is the exact failure this
 --- whole design targets.
 function OPS.write(c)
-    local o = resolve(c.obj)
-    if not valid(o) then return { ok = false, err = "object not found" } end
+    local o, why = resolve(c.obj, c.allow_scan)
+    if not valid(o) then
+        return { ok = false, err = why or "object not found" }
+    end
 
     local before
     pcall(function() before = o[c.prop] end)
@@ -253,8 +312,10 @@ function OPS.write(c)
 end
 
 function OPS.call(c)
-    local o = resolve(c.obj)
-    if not valid(o) then return { ok = false, err = "object not found" } end
+    local o, why = resolve(c.obj, c.allow_scan)
+    if not valid(o) then
+        return { ok = false, err = why or "object not found" }
+    end
     local ret, called
     local ok = pcall(function() ret = o[c.fn](o); called = true end)
     if not ok or not called then return { ok = false, err = "call failed" } end
