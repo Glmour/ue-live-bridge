@@ -16,7 +16,7 @@ python drive.py demo
 ```
 
 ```
-Nine bridges. All but one of them report a write that succeeded.
+Ten bridges. All but one of them report a write that succeeded.
 
 
   bridge                     what it does                            verdict              caught by
@@ -30,6 +30,7 @@ Nine bridges. All but one of them report a write that succeeded.
   restore refused            verifies fine, then keeps the poison    POISON_STUCK         reading the cleanup back
   object vanishes mid-probe  stops answering reads after the poison  RESTORE_UNVERIFIED   restoring anyway, then reporting it could not tell
   cleanup unreadable         answers everything until the restore    RESTORE_UNVERIFIED   refusing to call an unreadable world clean
+  honest bridge, huge value  writes land on a 1e20 property          CONFIRMED            scaling the poison to the magnitude
 ```
 
 Standard library only, nothing to install, about two seconds. Each bridge is stopped by a different layer, and **`stale reader` is the one to look at**: both channels agree, every assertion passes, and only poisoning the check on purpose exposes it.
@@ -43,7 +44,7 @@ The demo is also its own negative control. It asserts the expected verdict for e
   That is this demo failing its own negative control.
 ```
 
-That property is checked rather than claimed: disabling each of the nine guards in turn — poison-landed, poison-noticed, cross-channel, false-success, honest-failure, poison-stuck, restore-unverified, interrupted-probe — turns the demo red. It did not always. A review found that three branches had no scenario at all and could have rotted in silence, which is how the last four rows got here.
+That property is checked rather than claimed: disabling each guard in turn — poison-landed, poison-noticed, cross-channel, false-success, honest-failure, poison-stuck, restore-unverified, interrupted-probe, the poison chooser — turns the demo or `test/poison_test.py` red. It did not always. A review found that three branches had no scenario at all and could have rotted in silence, which is how the last four rows got here.
 
 `--verbose` prints the eight steps behind each verdict.
 
@@ -190,7 +191,8 @@ property first and decide whether the excursion is acceptable before you write i
 The verification logic runs off-engine, against a simulated game that can be told to lie:
 
 ```bash
-python drive.py demo                                   # four bridges end to end, no game
+python drive.py demo                                   # ten bridges end to end, no game
+python test/poison_test.py                             # the poison chooser, on its own
 python test/spike_test.py                              # verification logic in isolation
 python test/mcp_test.py                                # the same four bridges through MCP
 python test/lua_syntax.py --self-test                  # the syntax checker, on a broken file

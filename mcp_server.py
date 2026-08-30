@@ -23,7 +23,7 @@ from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 
-from drive import FileBridge, restore_and_check
+from drive import FileBridge, poison_for, restore_and_check
 from verify import Verdict
 
 DATA_DIR = os.environ.get("UE_LIVE_BRIDGE_DATA", "")
@@ -44,7 +44,10 @@ server = MCPServer(
         "second is not a bug -- check whether the game owns that field before "
         "concluding the bridge is broken. POISON_STUCK means the write worked "
         "but verification left a poison value live in the game: say so to the "
-        "user and fix that before doing anything else with that property."
+        "user and fix that before doing anything else with that property. "
+        "WITHHELD also covers a value so large that no poison can be told "
+        "apart from it in float64 -- the write may have landed, but nothing "
+        "proved the check could have said otherwise."
     ),
 )
 
@@ -89,8 +92,8 @@ def call_function(obj: str, fn: str) -> dict:
         "proven capable of failing. Anything else means the write should be "
         "treated as not having happened. "
         "SIDE EFFECT: verification performs FOUR writes, not one -- the target "
-        "value, then a poison value (target + 1234) to prove the check can fail, "
-        "then the final value. The poison is live in the game for roughly half a "
+        "value, then a poison value (offset from the target, scaled to its "
+        "magnitude) to prove the check can fail, then the final value. The poison is live in the game for roughly half a "
         "second. Do not point this at a property the game consumes continuously "
         "(health, position, timers) unless that excursion is acceptable. The "
         "restore is read back, so POISON_STUCK is reported rather than left "
@@ -167,8 +170,21 @@ def write_property(obj: str, prop: str, value: float) -> dict:
     # and the restore -- a timeout while the game hitches, an object that got
     # collected -- would otherwise leave target+1234 in the world as the last
     # thing this tool ever wrote, and say nothing about it.
-    poison = float(value) + 1234.0
     want_final = original if _restore_original else value
+    # The poison must be distinguishable from the value AND from whatever the
+    # restore will put back, or a correct bridge gets convicted. See poison_for.
+    chosen = poison_for(value, avoid=(float(want_final),)
+                        if isinstance(want_final, (int, float)) else ())
+    if chosen is None:
+        return {
+            "verdict": Verdict.WITHHELD.value,
+            "detail": f"no poison value can be told apart from {value} at this "
+                      "magnitude, so the check was never shown to be capable of "
+                      "failing. The write may well have landed; this run cannot "
+                      "say the check would have noticed if it had not",
+            "original": original,
+        }
+    poison = chosen
     cleanup: dict = {"state": "not attempted"}
 
     try:

@@ -4,7 +4,7 @@ Drive the in-game bridge from outside.
 Commands: demo, ping, find, read, bench, and probe.
 
 `demo` needs no game and no arguments -- it runs the verification against three
-bridges, one honest and two that lie, and shows which claims survive.
+bridges, most of which lie, and shows which claims survive.
 
     python drive.py demo
 
@@ -85,6 +85,51 @@ class FileBridge:
         if not r.get("ok"):
             raise RuntimeError(r.get("err", "read failed"))
         return r["value"]
+
+
+def near(a: object, x: float) -> bool:
+    return isinstance(a, (int, float)) and abs(float(a) - x) < 1e-6
+
+
+def poison_for(value: float, avoid: tuple[float, ...] = ()) -> float | None:
+    """Pick a poison that is provably distinguishable from the value it poisons.
+
+    The delta used to be a flat +1234. Two ways that produced a wrong verdict,
+    both found by arithmetic rather than by a bridge misbehaving:
+
+    * Above about 1e20, float64 absorbs 1234 entirely: the poison IS the value,
+      the check "fails" to notice a change that never happened, and a perfectly
+      honest bridge is reported DEAD_CHECK. A false accusation, which is the
+      mirror of the false pass this tool exists to prevent and no better.
+    * With --restore-original, a property whose original happens to sit exactly
+      1234 above the requested value made a correct restore read back as the
+      poison, and reported POISON_STUCK against a bridge that did as it was told.
+
+    So the delta scales with magnitude, and any candidate that cannot be told
+    apart from the value or from anything in `avoid` is rejected. Returns None
+    when no such value exists -- for inf and nan there is nothing to pick, and
+    "no poison could be built" is a WITHHELD, never a DEAD_CHECK.
+    """
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    v = float(value)
+    # Redundant with the loop below -- every candidate built from a nan or an
+    # inf is itself nan or inf and gets rejected there, so removing this changes
+    # no result. Kept for the short circuit and named as redundant, because a
+    # guard nothing can kill should not be left looking load-bearing.
+    if v != v or v in (float("inf"), float("-inf")):
+        return None
+
+    step = max(1234.0, abs(v) * 1e-6)
+    for mult in (1, 8, 64, 512, 4096, 32768):
+        for sign in (1.0, -1.0):
+            cand = v + sign * step * mult
+            if cand != cand or cand in (float("inf"), float("-inf")):
+                continue
+            if near(cand, v) or any(near(cand, a) for a in avoid):
+                continue
+            return cand
+    return None
 
 
 def restore_and_check(b: FileBridge, obj: str, prop: str,
@@ -197,7 +242,17 @@ def probe(b: FileBridge, cls: str, prop: str) -> Verdict | None:
     # runs under try/finally. A timeout while the game hitches, or an object
     # collected mid-probe, would otherwise make the poison write the last thing
     # this tool ever did to that property -- and say nothing about it.
-    poison_val = float(target) + 1234.0
+    chosen = poison_for(target, avoid=(float(original),))
+    if chosen is None:
+        print(f"\n[7] negative control")
+        print(f"    no poison can be told apart from {target!r} at this magnitude,")
+        print("    so the check was never shown to be capable of failing")
+        print("\n" + "=" * 58)
+        print("VERDICT WITHHELD: no distinguishable poison exists for this value.")
+        print("The write may well have landed; nothing here proves the check could")
+        print("have said otherwise.")
+        return Verdict.WITHHELD
+    poison_val = chosen
     poison_landed = noticed = False
     interrupted: Exception | None = None
     try:
@@ -285,47 +340,57 @@ def probe(b: FileBridge, cls: str, prop: str) -> Verdict | None:
 SCENARIOS = [
     ("honest bridge",
      dict(lie=False, deadcheck=False, stale_reads=False),
-     Verdict.CONFIRMED, "writes land", "-"),
+     Verdict.CONFIRMED, "writes land", "-", "Health"),
     ("silent drop",
      dict(lie=True, deadcheck=False, stale_reads=False),
      Verdict.FALSE_SUCCESS, "acks the write, changes nothing",
-     "the independent re-read"),
+     "the independent re-read", "Health"),
     ("inconsistent liar",
      dict(lie=True, deadcheck=True, stale_reads=False),
      Verdict.INCONSISTENT_BRIDGE, "fakes the read but not the write site",
-     "cross-channel agreement"),
+     "cross-channel agreement", "Health"),
     ("stale reader",
      dict(lie=False, deadcheck=False, stale_reads=True),
      Verdict.DEAD_CHECK, "both channels agree; reads are cached",
-     "the negative control, and nothing else"),
+     "the negative control, and nothing else", "Health"),
 
-    # The four below exist because a review found that three of the seven
+    # The five below exist because a review found that three of the seven
     # verdict branches had no scenario at all: their guards could rot and this
     # demo would still print a clean table. A demo whose own negative control
     # covers four sevenths of the thing it is demonstrating is not much of one.
     ("honest bridge that fails",
      dict(wrote_false=True),
      Verdict.HONEST_FAILURE, "says plainly that it did not write",
-     "reading the field it set"),
+     "reading the field it set", "Health"),
     ("poison refused",
      dict(refuse_nth_write=2),
      Verdict.WITHHELD, "drops the poison write only",
-     "requiring the poison to land first"),
+     "requiring the poison to land first", "Health"),
     ("restore refused",
      dict(refuse_nth_write=3),
      Verdict.POISON_STUCK, "verifies fine, then keeps the poison",
-     "reading the cleanup back"),
+     "reading the cleanup back", "Health"),
     ("object vanishes mid-probe",
      dict(vanish_after_write=2),
      Verdict.RESTORE_UNVERIFIED, "stops answering reads after the poison",
-     "restoring anyway, then reporting it could not tell"),
+     "restoring anyway, then reporting it could not tell", "Health"),
     # Same verdict, different road. RESTORE_UNVERIFIED is reachable two ways --
     # interrupted mid-probe, or completed but with an unreadable cleanup -- and
     # a scenario for one of them leaves the other's guard free to rot.
     ("cleanup unreadable",
      dict(vanish_after_write=3),
      Verdict.RESTORE_UNVERIFIED, "answers everything until the restore",
-     "refusing to call an unreadable world clean"),
+     "refusing to call an unreadable world clean", "Health"),
+
+    # Not a lying bridge at all -- an honest one, on a value large enough that
+    # float64 swallows a flat +1234 poison whole. The harness used to convict
+    # it of a DEAD_CHECK: the poison never differed from the value, so of
+    # course the check did not notice. A false accusation is the mirror of a
+    # false pass, and this repository has no business shipping either.
+    ("honest bridge, huge value",
+     dict(lie=False, deadcheck=False, stale_reads=False),
+     Verdict.CONFIRMED, "writes land on a 1e20 property",
+     "scaling the poison to the magnitude", "HugeCounter"),
 ]
 
 
@@ -342,7 +407,8 @@ def _load_fake_bridge():
     return mod
 
 
-def _run_scenario(fake, flags: dict, verbose: bool) -> tuple[Verdict | None, str]:
+def _run_scenario(fake, flags: dict, verbose: bool,
+                  prop: str = "Health") -> tuple[Verdict | None, str]:
     """Serve one fake bridge in a thread and probe it. Returns (verdict, log)."""
     stop, ready = threading.Event(), threading.Event()
     with tempfile.TemporaryDirectory(prefix="ue-live-demo-") as tmp:
@@ -369,7 +435,7 @@ def _run_scenario(fake, flags: dict, verbose: bool) -> tuple[Verdict | None, str
             b = FileBridge(data, timeout=5.0, poll=0.01)
             sink = contextlib.nullcontext() if verbose else contextlib.redirect_stdout(buf)
             with sink:
-                verdict = probe(b, "BP_PlayerCharacter_C", "Health")
+                verdict = probe(b, "BP_PlayerCharacter_C", prop)
         except TimeoutError as e:
             return None, f"{buf.getvalue()}\nTIMEOUT: {e}"
         finally:
@@ -389,14 +455,14 @@ def demo(verbose: bool = False) -> int:
         print(f"{e}", file=sys.stderr)
         return 2
 
-    print("\nNine bridges. All but one of them report a write that succeeded.\n")
+    print("\nTen bridges. All but one of them report a write that succeeded.\n")
     rows, wrong = [], 0
 
-    for name, flags, expected, blurb, caught_by in SCENARIOS:
+    for name, flags, expected, blurb, caught_by, prop in SCENARIOS:
         if verbose:
             print("\n" + "-" * 62)
             print(f"-- {name}: {blurb}")
-        got, log = _run_scenario(fake, flags, verbose)
+        got, log = _run_scenario(fake, flags, verbose, prop)
         ok = got == expected
         if not ok:
             wrong += 1

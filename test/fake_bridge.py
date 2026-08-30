@@ -34,6 +34,9 @@ from pathlib import Path
 INITIAL_WORLD = {
     "BP_PlayerCharacter_C /Game/Maps/L_Test.L_Test:PersistentLevel.BP_PlayerCharacter_C_0": {
         "Health": 100.0, "MaxHealth": 100.0,
+        # Large enough that a flat +1234 poison is absorbed by float64.
+        # A healthy bridge used to be convicted of a DEAD_CHECK here.
+        "HugeCounter": 1e20,
     },
 }
 
