@@ -92,7 +92,14 @@ end
 local function parseLine(line)
     local o = {}
     for k, v in line:gmatch('"([%w_]+)"%s*:%s*"([^"]*)"') do o[k] = v end
-    for k, v in line:gmatch('"([%w_]+)"%s*:%s*(-?%d+%.?%d*)') do o[k] = tonumber(v) end
+    -- The exponent part is not optional decoration. Python emits 5e-05 for any
+    -- float below 1e-4, and a pattern that stops at the 'e' captures "5" --
+    -- writing a value 100000x the one that was asked for, silently, into a
+    -- live game. tonumber rejects a malformed tail, so a bad capture becomes
+    -- a missing field rather than a wrong number.
+    for k, v in line:gmatch('"([%w_]+)"%s*:%s*(-?%d+%.?%d*[eE]?[-+]?%d*)') do
+        o[k] = tonumber(v)
+    end
     for k, v in line:gmatch('"([%w_]+)"%s*:%s*(true)') do o[k] = true end
     for k, v in line:gmatch('"([%w_]+)"%s*:%s*(false)') do o[k] = false end
     return o

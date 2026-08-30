@@ -37,11 +37,15 @@ from verify import Verdict
 class FileBridge:
     """Talks to the in-game Lua bridge over the two append-only files."""
 
-    def __init__(self, data_dir: Path, timeout: float = 8.0):
+    def __init__(self, data_dir: Path, timeout: float = 8.0, poll: float = 0.15):
         self.dir = Path(data_dir)
         self.cmd = self.dir / "cmd.jsonl"
         self.resp = self.dir / "resp.jsonl"
         self.timeout = timeout
+        # A game answers on its own tick, so polling faster than this buys
+        # nothing against a real bridge. The in-process demo has no tick to
+        # wait for, and at 0.15s it spent twelve seconds doing nothing.
+        self.poll = poll
         self._id = int(time.time()) % 100000
         self.dir.mkdir(parents=True, exist_ok=True)
         self.cmd.touch(exist_ok=True)
@@ -69,7 +73,7 @@ class FileBridge:
                 if obj.get("id") == want_id:
                     self._seen = len(lines)
                     return obj
-            time.sleep(0.15)
+            time.sleep(self.poll)
         raise TimeoutError(
             f"no response to id={want_id} within {self.timeout}s. "
             "Is the game running with GameBridge loaded, and is this the right data dir?"
@@ -81,6 +85,44 @@ class FileBridge:
         if not r.get("ok"):
             raise RuntimeError(r.get("err", "read failed"))
         return r["value"]
+
+
+def restore_and_check(b: FileBridge, obj: str, prop: str,
+                      want: float, poison: float) -> dict:
+    """Put the value back and find out whether it went back.
+
+    Returns one of three states, never a boolean. `unknown` exists because a
+    read that fails is not a world that is clean, and the two must not share a
+    name -- collapsing them is how an unreadable cleanup gets reported as a
+    verified one.
+
+    Lives here rather than in each caller because the CLI and the MCP tool
+    already drifted apart once on logic they had both hand-written.
+    """
+    def near(a: object, x: float) -> bool:
+        return isinstance(a, (int, float)) and abs(float(a) - x) < 1e-6
+
+    out: dict = {"state": "unknown", "wanted": want}
+    try:
+        w = b.send(op="write", obj=obj, prop=prop, value=want)
+        out["write_ok"] = bool(w.get("ok"))
+        r = b.send(op="read", obj=obj, prop=prop)
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"
+        return out
+
+    if not r.get("ok"):
+        out["error"] = r.get("err", "read failed")
+        return out
+
+    out["observed"] = r.get("value")
+    if near(r.get("value"), poison):
+        out["state"] = "poisoned"
+    elif near(r.get("value"), want):
+        out["state"] = "restored"
+    # else: neither the value we wrote nor the poison. Something else owns this
+    # property, which is worth saying rather than rounding to "restored".
+    return out
 
 
 def probe(b: FileBridge, cls: str, prop: str) -> Verdict | None:
@@ -106,7 +148,14 @@ def probe(b: FileBridge, cls: str, prop: str) -> Verdict | None:
     obj = objs[0]
 
     print(f"\n[3] read {prop}")
-    original = b.read(obj, prop)
+    r3 = b.send(op="read", obj=obj, prop=prop)
+    if not r3.get("ok"):
+        # The MCP tool answers UNREADABLE here. This used to raise, so the same
+        # bridge response produced a verdict on one path and a traceback on the
+        # other -- the drift that sharing a verdict vocabulary was meant to end.
+        print(f"    unreadable: {r3.get('err', 'read failed')}")
+        return Verdict.UNREADABLE
+    original = r3["value"]
     print(f"    {prop} = {original!r}")
     if not isinstance(original, (int, float)):
         print("    need a numeric property for the write test")
@@ -128,8 +177,9 @@ def probe(b: FileBridge, cls: str, prop: str) -> Verdict | None:
     )
 
     print(f"\n[5] postcondition: independent re-read")
-    observed = b.read(obj, prop)
-    holds = abs(float(observed) - target) < 1e-6
+    r5 = b.send(op="read", obj=obj, prop=prop)
+    observed = r5.get("value") if r5.get("ok") else None
+    holds = isinstance(observed, (int, float)) and abs(float(observed) - target) < 1e-6
     print(f"    re-read {prop} = {observed!r}  -> {'target' if holds else 'NOT target'}")
 
     print(f"\n[6] cross-channel agreement")
@@ -142,33 +192,50 @@ def probe(b: FileBridge, cls: str, prop: str) -> Verdict | None:
     # The poison must be shown to have LANDED before its result means anything.
     # A poison that silently fails to apply makes a dead check look alive, which
     # is how this harness fooled itself on the first run.
+    #
+    # From here to the restore there is a poison value in a live game, so it
+    # runs under try/finally. A timeout while the game hitches, or an object
+    # collected mid-probe, would otherwise make the poison write the last thing
+    # this tool ever did to that property -- and say nothing about it.
     poison_val = float(target) + 1234.0
-    pw = b.send(op="write", obj=obj, prop=prop, value=poison_val)
-    poison_landed = (
-        isinstance(pw.get("after"), (int, float))
-        and abs(float(pw["after"]) - poison_val) < 1e-6
-    )
-    poisoned = b.read(obj, prop)
-    noticed = abs(float(poisoned) - target) >= 1e-6
-    print(f"    poison landed at write site: {poison_landed}")
-    print(f"    re-read after poison: {poisoned!r}; check "
-          f"{'went RED' if noticed else 'still passed'}")
-    if not poison_landed:
-        print("    poison never applied -- the negative control proves nothing here")
+    poison_landed = noticed = False
+    interrupted: Exception | None = None
+    try:
+        pw = b.send(op="write", obj=obj, prop=prop, value=poison_val)
+        poison_landed = (
+            isinstance(pw.get("after"), (int, float))
+            and abs(float(pw["after"]) - poison_val) < 1e-6
+        )
+        pr = b.send(op="read", obj=obj, prop=prop)
+        if not pr.get("ok"):
+            raise RuntimeError(pr.get("err", "read failed"))
+        poisoned = pr["value"]
+        noticed = abs(float(poisoned) - target) >= 1e-6
+        print(f"    poison landed at write site: {poison_landed}")
+        print(f"    re-read after poison: {poisoned!r}; check "
+              f"{'went RED' if noticed else 'still passed'}")
+        if not poison_landed:
+            print("    poison never applied -- the negative control proves nothing here")
+    except Exception as e:
+        interrupted = e
+        print(f"    INTERRUPTED: {type(e).__name__}: {e}")
 
     print(f"\n[8] restore")
-    b.send(op="write", obj=obj, prop=prop, value=original)
-    restored = b.read(obj, prop)
-    # The negative control put a poison value into a live game. Leaving it there
-    # is worse than any verdict this function can return, so the restore is
-    # checked rather than assumed -- an unchecked cleanup is a dead check too.
-    still_poisoned = (
-        poison_landed
-        and isinstance(restored, (int, float))
-        and abs(float(restored) - poison_val) < 1e-6
-    )
-    print(f"    {prop} = {restored!r}"
-          + ("   <-- STILL POISONED" if still_poisoned else ""))
+    cleanup = restore_and_check(b, obj, prop, original, poison_val)
+    print(f"    {prop} = {cleanup.get('observed', '<unreadable>')!r}"
+          f"   [{cleanup['state']}]"
+          + (f"  {cleanup['error']}" if cleanup.get("error") else ""))
+    if cleanup["state"] == "poisoned":
+        print("    STILL POISONED -- the game is holding the poison value")
+    elif cleanup["state"] == "unknown":
+        print("    cleanup could not be read back; whether the poison is out is unknown")
+
+    if interrupted is not None:
+        print("\n" + "=" * 58)
+        print("RESTORE UNVERIFIED: verification was interrupted after the poison")
+        print(f"was written ({type(interrupted).__name__}). No verdict about the")
+        print("write is available, and the cleanup state above is what matters.")
+        return Verdict.RESTORE_UNVERIFIED
 
     print("\n" + "=" * 58)
     # Order matters. The negative control is what licenses trusting a PASS; it is
@@ -195,10 +262,15 @@ def probe(b: FileBridge, cls: str, prop: str) -> Verdict | None:
     if not noticed:
         print("DEAD CHECK: the check survived a poison that provably landed.")
         return Verdict.DEAD_CHECK
-    if still_poisoned:
+    if cleanup["state"] == "poisoned":
         print("POISON STUCK: the check is alive and the write landed, but the")
         print("restore did not take. The game is holding the poison value.")
         return Verdict.POISON_STUCK
+    if cleanup["state"] != "restored":
+        print("RESTORE UNVERIFIED: everything verified except the cleanup, which")
+        print("could not be read back. An unreadable read is not a clean world --")
+        print("treat that property as suspect until you have read it yourself.")
+        return Verdict.RESTORE_UNVERIFIED
     print("Chain verified end to end, and the check is provably alive.")
     return Verdict.CONFIRMED
 
@@ -226,6 +298,34 @@ SCENARIOS = [
      dict(lie=False, deadcheck=False, stale_reads=True),
      Verdict.DEAD_CHECK, "both channels agree; reads are cached",
      "the negative control, and nothing else"),
+
+    # The four below exist because a review found that three of the seven
+    # verdict branches had no scenario at all: their guards could rot and this
+    # demo would still print a clean table. A demo whose own negative control
+    # covers four sevenths of the thing it is demonstrating is not much of one.
+    ("honest bridge that fails",
+     dict(wrote_false=True),
+     Verdict.HONEST_FAILURE, "says plainly that it did not write",
+     "reading the field it set"),
+    ("poison refused",
+     dict(refuse_nth_write=2),
+     Verdict.WITHHELD, "drops the poison write only",
+     "requiring the poison to land first"),
+    ("restore refused",
+     dict(refuse_nth_write=3),
+     Verdict.POISON_STUCK, "verifies fine, then keeps the poison",
+     "reading the cleanup back"),
+    ("object vanishes mid-probe",
+     dict(vanish_after_write=2),
+     Verdict.RESTORE_UNVERIFIED, "stops answering reads after the poison",
+     "restoring anyway, then reporting it could not tell"),
+    # Same verdict, different road. RESTORE_UNVERIFIED is reachable two ways --
+    # interrupted mid-probe, or completed but with an unreadable cleanup -- and
+    # a scenario for one of them leaves the other's guard free to rot.
+    ("cleanup unreadable",
+     dict(vanish_after_write=3),
+     Verdict.RESTORE_UNVERIFIED, "answers everything until the restore",
+     "refusing to call an unreadable world clean"),
 ]
 
 
@@ -244,20 +344,29 @@ def _load_fake_bridge():
 
 def _run_scenario(fake, flags: dict, verbose: bool) -> tuple[Verdict | None, str]:
     """Serve one fake bridge in a thread and probe it. Returns (verdict, log)."""
-    stop = threading.Event()
+    stop, ready = threading.Event(), threading.Event()
     with tempfile.TemporaryDirectory(prefix="ue-live-demo-") as tmp:
         data = Path(tmp) / "data"
         thread = threading.Thread(
             target=fake.run,
-            kwargs=dict(data=data, stop=stop, quiet=True, **flags),
+            kwargs=dict(data=data, stop=stop, quiet=True, ready=ready, **flags),
             daemon=True,
         )
         thread.start()
+        # The simulator skips whatever is in the command file when it starts.
+        # Sending before it has taken that mark means the first command is read
+        # as a leftover and never answered -- the scenario then times out and
+        # the demo reports itself as having failed its own negative control,
+        # which is a lie about a lie detector.
+        if not ready.wait(timeout=5.0):
+            stop.set()
+            thread.join(timeout=3.0)
+            return None, "the simulator never signalled ready"
         buf = io.StringIO()
         try:
             # A short timeout: nothing here waits on a game, so an eight-second
             # hang would be the simulator being wedged, not slow I/O.
-            b = FileBridge(data, timeout=5.0)
+            b = FileBridge(data, timeout=5.0, poll=0.01)
             sink = contextlib.nullcontext() if verbose else contextlib.redirect_stdout(buf)
             with sink:
                 verdict = probe(b, "BP_PlayerCharacter_C", "Health")
@@ -280,7 +389,7 @@ def demo(verbose: bool = False) -> int:
         print(f"{e}", file=sys.stderr)
         return 2
 
-    print("\nFour bridges. Every one of them reports that the write succeeded.\n")
+    print("\nNine bridges. All but one of them report a write that succeeded.\n")
     rows, wrong = [], 0
 
     for name, flags, expected, blurb, caught_by in SCENARIOS:
@@ -306,11 +415,12 @@ def demo(verbose: bool = False) -> int:
         tail = caught_by if ok else f"!! expected {expected.value}"
         print(f"  {name.ljust(w)}  {blurb.ljust(d)}  {shown}  {tail}")
 
-    print("\n  Every row after the first claimed a success it did not earn, and")
-    print("  each one is stopped by a different layer. The last is the point:")
-    print("  both channels agree, every assertion passes, and the only thing")
-    print("  separating it from a real success is poisoning the check on")
-    print("  purpose and requiring it to go red.\n")
+    print("\n  Each bridge is stopped by a different layer, and every verdict the")
+    print("  harness can reach appears above -- so breaking any one guard turns")
+    print("  this table red rather than leaving it quietly wrong. 'stale reader'")
+    print("  is the one to look at: both channels agree, every assertion passes,")
+    print("  and only poisoning the check on purpose separates it from a real")
+    print("  success.\n")
 
     if wrong:
         print(f"  {wrong} scenario(s) did not produce the expected verdict.")

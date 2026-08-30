@@ -40,11 +40,15 @@ INITIAL_WORLD = {
 
 def run(
     data: Path,
-    lie: bool,
-    deadcheck: bool,
+    lie: bool = False,
+    deadcheck: bool = False,
     stop: threading.Event | None = None,
     quiet: bool = False,
     stale_reads: bool = False,
+    wrote_false: bool = False,
+    refuse_nth_write: int = 0,
+    vanish_after_write: int = 0,
+    ready: threading.Event | None = None,
 ) -> None:
     """Serve the two-file protocol until `stop` is set (or forever, if None)."""
     world = {obj: dict(props) for obj, props in INITIAL_WORLD.items()}
@@ -54,6 +58,13 @@ def run(
     cmd.touch(exist_ok=True)
     resp.touch(exist_ok=True)
     cursor = sum(1 for _ in cmd.open(encoding="utf-8", errors="replace"))
+    # Everything already in the file at this instant is a previous session's
+    # traffic and gets skipped. A caller that sends before this line runs would
+    # have its first command skipped too, so it is told when the cursor is set
+    # rather than left to guess -- an in-process demo loses that race often
+    # enough to accuse itself of failing its own negative control.
+    if ready is not None:
+        ready.set()
 
     def reply(o: dict) -> None:
         with resp.open("a", encoding="utf-8") as f:
@@ -70,6 +81,11 @@ def run(
     # Filled by the FIRST write to a property and never updated. A read served
     # from here is stale, not wrong -- which is why nothing downstream notices.
     pinned: dict[tuple[str, str], float] = {}
+    # Writes are counted so a scenario can target one of them by position. A
+    # probe writes three times: the target, the poison, then the restore.
+    # Refusing the second reaches WITHHELD, refusing the third reaches
+    # POISON_STUCK, and neither branch had any way to be exercised before.
+    writes = 0
 
     while stop is None or not stop.is_set():
         lines = cmd.open(encoding="utf-8", errors="replace").readlines()
@@ -90,6 +106,11 @@ def run(
                 keys = [k for k in world if k.startswith(c.get("class", ""))]
                 out = {"ok": True, "count": len(keys), "objects": keys}
             elif op == "read":
+                if vanish_after_write and writes >= vanish_after_write:
+                    out = {"ok": False, "err": "object not found"}
+                    out["id"] = c.get("id")
+                    reply(out)
+                    continue
                 key = (c["obj"], c["prop"])
                 if stale_reads and key in pinned:
                     out = {"ok": True, "value": pinned[key], "vtype": "number"}
@@ -101,11 +122,28 @@ def run(
                     except KeyError:
                         out = {"ok": False, "err": "object not found"}
             elif op == "write":
+                writes += 1
                 try:
                     before = world[c["obj"]][c["prop"]]
                 except KeyError:
                     out = {"ok": False, "err": "object not found"}
                 else:
+                    if wrote_false:
+                        # ok, and honest about not having written.
+                        out = {"ok": True, "wrote": False, "before": before,
+                               "after": before, "requested": c["value"]}
+                        out["id"] = c.get("id")
+                        reply(out)
+                        continue
+                    if refuse_nth_write and writes == refuse_nth_write:
+                        # Acknowledged, silently not applied. The write site
+                        # reports the old value, so a caller that reads it can
+                        # tell -- which is the whole point of that channel.
+                        out = {"ok": True, "wrote": True, "before": before,
+                               "after": before, "requested": c["value"]}
+                        out["id"] = c.get("id")
+                        reply(out)
+                        continue
                     if stale_reads:
                         # Echo the request, so the write site looks flawless.
                         pinned.setdefault((c["obj"], c["prop"]), c["value"])
@@ -133,5 +171,10 @@ if __name__ == "__main__":
     ap.add_argument("--lie", action="store_true")
     ap.add_argument("--deadcheck", action="store_true")
     ap.add_argument("--stale-reads", action="store_true")
+    ap.add_argument("--wrote-false", action="store_true")
+    ap.add_argument("--refuse-nth-write", type=int, default=0)
+    ap.add_argument("--vanish-after-write", type=int, default=0)
     a = ap.parse_args()
-    run(Path(a.data), a.lie, a.deadcheck, stale_reads=a.stale_reads)
+    run(Path(a.data), a.lie, a.deadcheck, stale_reads=a.stale_reads,
+        wrote_false=a.wrote_false, refuse_nth_write=a.refuse_nth_write,
+        vanish_after_write=a.vanish_after_write)

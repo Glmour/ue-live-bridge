@@ -23,7 +23,7 @@ from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 
-from drive import FileBridge
+from drive import FileBridge, restore_and_check
 from verify import Verdict
 
 DATA_DIR = os.environ.get("UE_LIVE_BRIDGE_DATA", "")
@@ -122,6 +122,14 @@ def write_property(obj: str, prop: str, value: float) -> dict:
     if not w.get("ok"):
         return {"verdict": Verdict.WRITE_REJECTED.value,
                 "detail": w.get("err", "write failed"), "original": original}
+    # A bridge that answers ok but sets wrote=false is telling the truth about
+    # not having written. The CLI has always read this field; this tool did not,
+    # so the same response produced HONEST_FAILURE there and CONFIRMED here.
+    if w.get("wrote") is False:
+        return {"verdict": Verdict.HONEST_FAILURE.value,
+                "detail": "the bridge reported that the write did not succeed, and "
+                          "did not claim otherwise; nothing to catch here -- fix the write",
+                "original": original}
 
     def near(a: Any, x: float) -> bool:
         return isinstance(a, (int, float)) and abs(float(a) - x) < 1e-6
@@ -153,52 +161,78 @@ def write_property(obj: str, prop: str, value: float) -> dict:
         }
 
     # The value looks right. That is not yet a reason to believe the check.
+    #
+    # Everything from here until the restore puts a poison value into a live
+    # game, so it runs under try/finally. An exception between the poison write
+    # and the restore -- a timeout while the game hitches, an object that got
+    # collected -- would otherwise leave target+1234 in the world as the last
+    # thing this tool ever wrote, and say nothing about it.
     poison = float(value) + 1234.0
-    pw = b.send(op="write", obj=obj, prop=prop, value=poison)
-    poison_landed = near(pw.get("after"), poison)
-    pr = b.send(op="read", obj=obj, prop=prop)
-    noticed = not (pr.get("ok") and near(pr.get("value"), value))
-
     want_final = original if _restore_original else value
-    b.send(op="write", obj=obj, prop=prop, value=want_final)
-    # The negative control left a poison value in a live game. Whether it came
-    # back out is a fact the caller has to have, so the cleanup is read back
-    # rather than assumed -- an unchecked restore is a dead check of its own.
-    fr = b.send(op="read", obj=obj, prop=prop)
-    left_holding = fr.get("value") if fr.get("ok") else None
-    still_poisoned = fr.get("ok") and near(fr.get("value"), poison)
+    cleanup: dict = {"state": "not attempted"}
 
+    try:
+        pw = b.send(op="write", obj=obj, prop=prop, value=poison)
+        poison_landed = near(pw.get("after"), poison)
+        pr = b.send(op="read", obj=obj, prop=prop)
+        noticed = not (pr.get("ok") and near(pr.get("value"), value))
+    except Exception as e:
+        cleanup = restore_and_check(b, obj, prop, want_final, poison)
+        return {
+            "verdict": Verdict.RESTORE_UNVERIFIED.value,
+            "detail": f"verification failed partway through ({type(e).__name__}: {e}). "
+                      "A poison value may have been written; see cleanup",
+            "original": original, "poison_value": poison, "cleanup": cleanup,
+        }
+
+    cleanup = restore_and_check(b, obj, prop, want_final, poison)
+
+    # Ordering note: cleanup state is attached to every verdict rather than
+    # gating them, because "the check is dead" and "the poison is still in the
+    # game" are separate facts and the caller needs both. Only the last two
+    # branches let cleanup decide the verdict, because only there is everything
+    # else already known to be fine.
     if not poison_landed:
         return {
             "verdict": Verdict.WITHHELD.value,
             "detail": "the poison never applied, so the check was never shown to be "
                       "capable of failing; the apparent success is unproven",
-            "original": original,
-            "world_left_holding": left_holding,
+            "original": original, "cleanup": cleanup,
         }
     if not noticed:
         return {
             "verdict": Verdict.DEAD_CHECK.value,
             "detail": "the check survived a poison that provably landed; it cannot "
                       "distinguish success from failure and its verdict means nothing. "
-                      "Reads through this bridge cannot be trusted, so the value "
-                      "reported below is itself suspect",
-            "original": original,
-            "world_left_holding": left_holding,
+                      "Reads through this bridge cannot be trusted, so the cleanup "
+                      "state below is itself suspect",
+            "original": original, "cleanup": cleanup,
         }
-    if still_poisoned:
+    if cleanup["state"] == "poisoned":
         return {
             "verdict": Verdict.POISON_STUCK.value,
             "detail": "the write landed and the check is alive, but the restore did "
                       "not take: the game is holding the poison value. Fix this "
                       "before anything else reads that property",
-            "original": original,
-            "poison_value": poison,
+            "original": original, "poison_value": poison, "cleanup": cleanup,
+        }
+    if cleanup["state"] != "restored":
+        # An unreadable read-back is not evidence of a clean world. Reporting
+        # CONFIRMED here would be this tool doing the exact thing it exists to
+        # catch: turning "I could not tell" into "it worked".
+        return {
+            "verdict": Verdict.RESTORE_UNVERIFIED.value,
+            "detail": "the write and the check both verified, but the cleanup could "
+                      "not be read back, so whether the poison is still in the game "
+                      "is unknown. Treat that property as suspect until you have "
+                      "read it yourself",
+            "original": original, "poison_value": poison, "cleanup": cleanup,
         }
 
     return {
         "verdict": Verdict.CONFIRMED.value,
-        "detail": "independently observed, and the check was proven able to fail",
+        "detail": "independently observed, the check was proven able to fail, and "
+                  "the poison was confirmed out of the world",
         "value": want_final,
         "original": original,
     }

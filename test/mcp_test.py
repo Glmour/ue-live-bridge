@@ -29,6 +29,13 @@ CASES = [
     ("lying bridge + faked reads", ["--lie", "--deadcheck"],  "INCONSISTENT_BRIDGE"),
     # Both channels agree and every assertion passes. Only the poison exposes it.
     ("stale reader",               ["--stale-reads"],         "DEAD_CHECK"),
+    # A review found three verdict branches with no case at all -- their guards
+    # could rot and this file would still print "all verdicts correct". A probe
+    # writes three times: target, poison, restore.
+    ("honest bridge that fails",   ["--wrote-false"],             "HONEST_FAILURE"),
+    ("poison refused",             ["--refuse-nth-write", "2"],   "WITHHELD"),
+    ("restore refused",            ["--refuse-nth-write", "3"],   "POISON_STUCK"),
+    ("cleanup unreadable",         ["--vanish-after-write", "3"], "RESTORE_UNVERIFIED"),
 ]
 
 failures: list[str] = []

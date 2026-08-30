@@ -16,19 +16,25 @@ python drive.py demo
 ```
 
 ```
-Four bridges. Every one of them reports that the write succeeded.
+Nine bridges. All but one of them report a write that succeeded.
 
-  bridge             what it does                           verdict              caught by
-  -----------------  -------------------------------------  -------------------  ----------------------------------
-  honest bridge      writes land                            CONFIRMED            -
-  silent drop        acks the write, changes nothing        FALSE_SUCCESS        the independent re-read
-  inconsistent liar  fakes the read but not the write site  INCONSISTENT_BRIDGE  cross-channel agreement
-  stale reader       both channels agree; reads are cached  DEAD_CHECK           the negative control, and nothing else
+
+  bridge                     what it does                            verdict              caught by
+  -------------------------  --------------------------------------  -------------------  ----------------------------------
+  honest bridge              writes land                             CONFIRMED            -
+  silent drop                acks the write, changes nothing         FALSE_SUCCESS        the independent re-read
+  inconsistent liar          fakes the read but not the write site   INCONSISTENT_BRIDGE  cross-channel agreement
+  stale reader               both channels agree; reads are cached   DEAD_CHECK           the negative control, and nothing else
+  honest bridge that fails   says plainly that it did not write      HONEST_FAILURE       reading the field it set
+  poison refused             drops the poison write only             WITHHELD             requiring the poison to land first
+  restore refused            verifies fine, then keeps the poison    POISON_STUCK         reading the cleanup back
+  object vanishes mid-probe  stops answering reads after the poison  RESTORE_UNVERIFIED   restoring anyway, then reporting it could not tell
+  cleanup unreadable         answers everything until the restore    RESTORE_UNVERIFIED   refusing to call an unreadable world clean
 ```
 
-Standard library only, nothing to install. Each lie is stopped by a different layer, and the last row is the point: both channels agree, every assertion passes, and **only poisoning the check exposes it**.
+Standard library only, nothing to install, about two seconds. Each bridge is stopped by a different layer, and **`stale reader` is the one to look at**: both channels agree, every assertion passes, and only poisoning the check on purpose exposes it.
 
-The demo is also its own negative control — it asserts the expected verdict for every row and exits non-zero if the harness ever stops catching a liar. Break the poison step and this is what you get instead, which is exactly the failure the tool exists to prevent:
+The demo is also its own negative control. It asserts the expected verdict for every row, and every verdict the harness can produce appears in the table — so disabling any one guard turns this red rather than leaving it quietly wrong. Break the poison step, for instance, and the stale reader collects a confident pass:
 
 ```
   stale reader       both channels agree; reads are cached  CONFIRMED            !! expected DEAD_CHECK
@@ -36,6 +42,8 @@ The demo is also its own negative control — it asserts the expected verdict fo
   1 scenario(s) did not produce the expected verdict.
   That is this demo failing its own negative control.
 ```
+
+That property is checked rather than claimed: disabling each of the nine guards in turn — poison-landed, poison-noticed, cross-channel, false-success, honest-failure, poison-stuck, restore-unverified, interrupted-probe — turns the demo red. It did not always. A review found that three branches had no scenario at all and could have rotted in silence, which is how the last four rows got here.
 
 `--verbose` prints the eight steps behind each verdict.
 
@@ -102,7 +110,7 @@ Two rules came out of that, and they are the whole design now:
 
 ## Verdicts
 
-The CLI and the MCP tool report the same six verification outcomes.
+The CLI and the MCP tool report the same seven verification outcomes.
 
 | MCP `verdict` | CLI line | Meaning | Exit |
 |---|---|---|---|
@@ -112,6 +120,7 @@ The CLI and the MCP tool report the same six verification outcomes.
 | `WITHHELD` | VERDICT WITHHELD | The poison never applied, so the apparent pass is unproven | 1 |
 | `DEAD_CHECK` | DEAD CHECK | The check survived a poison that provably landed | 1 |
 | `POISON_STUCK` | POISON STUCK | Everything verified, but the restore did not take and the game is still holding the poison | 1 |
+| `RESTORE_UNVERIFIED` | RESTORE UNVERIFIED | The cleanup could not be read back, so whether the poison is out is unknown | 1 |
 
 The MCP tool adds two that come before verification can even start: `UNREADABLE`
 (the property could not be read) and `WRITE_REJECTED` (the bridge refused the write),
@@ -189,10 +198,13 @@ python test/fake_bridge.py --data ./_t --lie           # then: python drive.py -
 ```
 
 `fake_bridge.py` reproduces every failure mode on demand: `--lie` drops writes
-silently, `--deadcheck` additionally fakes the read-back, and `--stale-reads`
-serves both channels a consistent story from a cache — the only one of the three
-that the negative control alone can catch. The first two are how the design flaw
-below was found; the third is what proves the fix still works.
+silently, `--deadcheck` additionally fakes the read-back, `--stale-reads` serves
+both channels a consistent story from a cache — the only one of those that the
+negative control alone can catch — and `--wrote-false`, `--refuse-nth-write N`
+and `--vanish-after-write N` reach the branches for an honest failure, a poison
+that never lands, a restore that does not take, and a cleanup that cannot be
+read. The first two are how the design flaw below was found; the rest exist
+because a review pointed out that three verdicts had nothing exercising them.
 
 Every check in this repository is required to fail on demand, including the ones
 that check the checks. `lua_syntax.py --self-test` feeds itself deliberately

@@ -50,6 +50,7 @@ class Verdict(str, Enum):
     UNREADABLE = "UNREADABLE"    # could not read the property at all
     WRITE_REJECTED = "WRITE_REJECTED"  # the bridge refused the write, and said so
     POISON_STUCK = "POISON_STUCK"  # verification ran, but the world was left poisoned
+    RESTORE_UNVERIFIED = "RESTORE_UNVERIFIED"  # the cleanup could not be read back at all
 
 
 @dataclass
