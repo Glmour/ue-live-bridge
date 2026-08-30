@@ -144,19 +144,19 @@ local function resolve(name, allow_scan)
 
     -- Fallback: a linear sweep of the whole object array, on the game thread.
     --
-    -- Measured at ~1.25 us per object, and object count is dominated by the
-    -- engine and loaded assets rather than by world size -- a one-corridor game
-    -- carries 23,919 objects and another title's *main menu* carries 29,784. So
-    -- this costs 30 ms where it is cheapest and scales linearly from there:
-    -- ~125 ms at 100k objects, all of it a frame hitch.
+    -- Object count is dominated by the engine and loaded assets rather than by
+    -- world size: a one-corridor game carries 23,919 objects, and another
+    -- title's *main menu* carries 29,784. Even with the FName comparison below
+    -- that is ~0.8 us per object -- around 20 ms here, scaling linearly, and
+    -- every millisecond of it a frame hitch.
     --
-    -- That is too expensive to spend implicitly. Off by default: the caller is
-    -- told to run `find` first, which populates the cache from objects it is
-    -- already holding and costs nothing extra. Pass allow_scan to opt in.
+    -- Too expensive to spend implicitly, so it is off by default: the caller is
+    -- told to run `find` first, which fills the cache from objects it is already
+    -- holding and costs nothing extra. Pass allow_scan to opt in.
     if not allow_scan then
         return nil, "not cached; call find for this class first, or pass "
                  .. "allow_scan=1 to accept a full object-array sweep "
-                 .. "(~1.25us/object on the game thread)"
+                 .. "(~0.8us/object on the game thread)"
     end
 
     STATS.resolve_scans = STATS.resolve_scans + 1
@@ -164,8 +164,26 @@ local function resolve(name, allow_scan)
     pcall(function()
         local all = FindAllOf("Object")
         if not all then return end
+
+        -- Compare FNames, not full names. GetFullName builds a whole path string
+        -- per object; GetFName hands back the leaf, and unlike UObject, two
+        -- FNames compare correctly with ==. Measured on 23,919 objects:
+        -- GetFullName 1.76 us/obj, GetFName 0.81 us/obj -- 2.2x, before counting
+        -- that the full name is now built only for the handful of leaf matches.
+        -- The target FName is constructed once, outside the loop.
+        -- (Advice from the UE4SS maintainer on RE-UE4SS#1402.)
+        local leaf = name:match("([^%.:]+)$") or name
+        local target = FName(leaf)
+
         for i = 1, #all do
-            if fullName(all[i]) == name then found = all[i]; return end
+            local o = all[i]
+            local same
+            pcall(function() same = (o:GetFName() == target) end)
+            if same then
+                -- Leaf matched; now it is worth paying for the full path, since
+                -- distinct objects can share a leaf name across outers.
+                if fullName(o) == name then found = o; return end
+            end
         end
     end)
     if found then cachePut(found) end
@@ -338,6 +356,28 @@ function OPS.bench(c)
         end
     end)
 
+    -- The maintainer's suggested alternative (UE4SS-RE/RE-UE4SS#1402): compare
+    -- FNames rather than building a full path string per object, with the target
+    -- FName constructed once outside the loop.
+    local fname_avg, fname_worst, fname_ok = 0, 0, false
+    local probe = { eq_works = nil, ctor_ok = nil, getf_ok = nil }
+    pcall(function()
+        local target = FName("no-such-object")
+        probe.ctor_ok = target ~= nil
+        local one
+        pcall(function() one = all[1]:GetFName() end)
+        probe.getf_ok = one ~= nil
+        -- Does == on two FNames actually compare, or is it wrapper identity like
+        -- UObject? Worth knowing before trusting a loop built on it.
+        pcall(function() probe.eq_works = (all[1]:GetFName() == one) end)
+        fname_avg, fname_worst = timed(function()
+            for i = 1, n do
+                if all[i]:GetFName() == target then break end
+            end
+        end)
+        fname_ok = true
+    end)
+
     local function ms(x) return math.floor(x * 100000 + 0.5) / 100 end
     local function us(x) return math.floor((x / n) * 100000000 + 0.5) / 100 end
 
@@ -356,6 +396,10 @@ function OPS.bench(c)
         us_per_obj_control = us(ctrl_avg),
         us_per_obj_name = us(name_avg),
         us_per_obj_delta = us(name_avg - ctrl_avg),
+        fname_ms = fname_ok and ms(fname_avg) or nil,
+        fname_worst_ms = fname_ok and ms(fname_worst) or nil,
+        us_per_obj_fname = fname_ok and us(fname_avg) or nil,
+        fname_probe = probe,
         cached = cacheSize(),
     }
 end
@@ -454,9 +498,7 @@ local function pump()
     local blob = f:read("a") or ""
     f:close()
     local lines = {}
-    for line in blob:gmatch("([^
-]*)
-") do lines[#lines + 1] = line end
+    for line in blob:gmatch("([^\n]*)\n") do lines[#lines + 1] = line end
 
     local n = 0
     for _, line in ipairs(lines) do
