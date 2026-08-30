@@ -154,10 +154,15 @@ def probe(b: FileBridge, cls: str, prop: str) -> int:
     # Order matters. The negative control is what licenses trusting a PASS; it is
     # not needed to trust a FAIL. Two independent channels agreeing that nothing
     # changed is already conclusive, so that verdict is reported on its own.
+    if not claimed:
+        print("HONEST FAILURE: the bridge reported the write did not succeed, and")
+        print("did not claim otherwise. Nothing to catch here -- fix the write.")
+        return 1
     if contradiction:
         print("INCONSISTENT BRIDGE: the write site and the re-read disagree about")
-        print("whether the value changed. No verdict about success is available")
-        print("from this bridge -- a channel cannot verify itself.")
+        print("whether the value changed. Either a channel is lying, or the property")
+        print("is volatile and the game rewrote it between the two reads. Both are")
+        print("reasons not to trust a success verdict; only the first is a bug.")
         return 1
     if claimed and not holds:
         print("FALSE SUCCESS caught: the bridge reported a write it did not make.")
@@ -190,7 +195,7 @@ def main() -> int:
     elif a.cmd == "read":
         print(b.read(a.arg, a.prop))
     elif a.cmd == "bench":
-        r = b.send(op="bench", rounds=5)
+        r = b.send(op="bench", rounds=7, **{"class": a.arg if a.arg != "BP_PlayerCharacter_C" else "Object"})
         print(json.dumps(r, indent=1))
     else:
         return probe(b, a.arg, a.prop)

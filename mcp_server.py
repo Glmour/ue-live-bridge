@@ -44,9 +44,11 @@ server = MCPServer(
         "warms the resolver so later calls do not scan the object array.\n\n"
         "write_property returns a verdict, not a boolean. Treat any verdict "
         "other than CONFIRMED as the write NOT having happened, including "
-        "WITHHELD -- 'unproven' is not 'succeeded'. Do not retry a write on a "
-        "verdict of INCONSISTENT_BRIDGE; the bridge is unreliable and repeating "
-        "the call will not make it truthful."
+        "WITHHELD -- 'unproven' is not 'succeeded'. INCONSISTENT_BRIDGE has two "
+        "causes: a channel is lying, or the property is volatile and the game "
+        "rewrote it between the two reads. Retrying helps with neither, but the "
+        "second is not a bug -- check whether the game owns that field before "
+        "concluding the bridge is broken."
     ),
 )
 
@@ -89,7 +91,12 @@ def call_function(obj: str, fn: str) -> dict:
         "Write a property and verify it. Returns a verdict, never a bare success. "
         "CONFIRMED means the change was independently observed and the check was "
         "proven capable of failing. Anything else means the write should be "
-        "treated as not having happened."
+        "treated as not having happened. "
+        "SIDE EFFECT: verification performs FOUR writes, not one -- the target "
+        "value, then a poison value (target + 1234) to prove the check can fail, "
+        "then the final value. The poison is live in the game for roughly half a "
+        "second. Do not point this at a property the game consumes continuously "
+        "(health, position, timers) unless that excursion is acceptable."
     )
 )
 def write_property(obj: str, prop: str, value: float) -> dict:
@@ -129,7 +136,9 @@ def write_property(obj: str, prop: str, value: float) -> dict:
         return {
             "verdict": "INCONSISTENT_BRIDGE",
             "detail": "the write site and an independent re-read disagree about "
-                      "whether the value changed; a channel cannot verify itself",
+                      "whether the value changed. Either a channel is lying, or "
+                      "the game rewrote a volatile property between the two reads; "
+                      "a channel cannot verify itself, so no verdict is available",
             "write_site_after": w.get("after"),
             "reread": r.get("value"),
             "original": original,

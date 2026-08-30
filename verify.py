@@ -106,9 +106,11 @@ class Verifier:
     def verify(self, pc: Postcondition, agent_claimed_success: bool) -> Result:
         """The whole point: separate what the agent *said* from what is *true*.
 
-        `agent_claimed_success` is the agent's own assertion, which is exactly the
-        signal the published measurements show to be wrong 45-76% of the time when
-        it fails. It is recorded, never trusted.
+        `agent_claimed_success` is the agent's own assertion. Two separate published
+        figures say not to trust it: 45-48% of agent *failures* close with a claim of
+        success, and separately, 75.8% of explicit success flags written by coding
+        agents were wrong. Different denominators, same conclusion -- record the
+        claim, never act on it. (arXiv:2606.09863) It is recorded, never trusted.
         """
         if not self.prove_alive(pc):
             return Result(

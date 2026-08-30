@@ -40,7 +40,9 @@ That is a real transcript against The Exit 8, not a mock.
 
 ## Why steps 6 and 7 exist
 
-Automated callers — agents especially — report success they did not achieve. This is measured, not folklore: across published trajectory studies, 45–48% of agent failures in single-control settings end with the agent asserting it finished, and among coding-agent runs that wrote an explicit structured success flag, **75.8% of those claims were wrong**. LLM judges do not catch it; across five judges and five prompt strategies none exceeded AUROC 0.65, and on raw call traces they sat near a coin flip, because judges reward assertion vocabulary rather than verified state change.
+Automated callers — agents especially — report success they did not achieve. This is measured, not folklore. [*From Confident Closing to Silent Failure*](https://arxiv.org/abs/2606.09863) (arXiv:2606.09863) went through 9,876 tau2-bench and 1,879 AppWorld trajectories and found that **45–48% of failures in single-control domains end with the agent asserting it finished**, and separately that **75.8% of explicit success flags written by coding agents were wrong** — two different denominators, same conclusion. LLM judges do not catch it: no configuration across five judges and five prompt strategies exceeded AUROC 0.65, and on raw call traces they reached 0.54, roughly a coin flip, because judges reward assertion vocabulary rather than verified state change.
+
+The same paper contains the number that shaped this tool: in the one dual-control domain, where a second party independently confirms the state change, false success drops to **3%**. That is a 15x difference from architecture rather than from a better model.
 
 The standard fix is right as far as it goes: assert a postcondition against the authoritative record, from a process the caller cannot write to. This tool does that at step 5.
 
@@ -65,7 +67,7 @@ Two rules came out of that, and they are the whole design now:
 
 ## Verdicts
 
-The CLI and the MCP tool report the same five outcomes.
+The CLI and the MCP tool report the same five verification outcomes.
 
 | MCP `verdict` | CLI line | Meaning | Exit |
 |---|---|---|---|
@@ -74,6 +76,11 @@ The CLI and the MCP tool report the same five outcomes.
 | `INCONSISTENT_BRIDGE` | INCONSISTENT BRIDGE | Write site and re-read disagree; no verdict is available | 1 |
 | `WITHHELD` | VERDICT WITHHELD | The poison never applied, so the apparent pass is unproven | 1 |
 | `DEAD_CHECK` | DEAD CHECK | The check survived a poison that provably landed | 1 |
+
+The MCP tool adds two that come before verification can even start: `UNREADABLE`
+(the property could not be read) and `WRITE_REJECTED` (the bridge refused the write),
+plus `HONEST FAILURE` on the CLI when the bridge reports the write failed and does not
+pretend otherwise.
 
 Only the first is a success. The other four are distinct facts, and collapsing
 them into "failed" throws away the part that tells you what to do next.
@@ -124,6 +131,13 @@ including `WITHHELD`, because *unproven* is not *succeeded*.
 
 That transcript is from The Exit 8, through the MCP tool, against the running game.
 
+**Verification is not free, and it is not read-only.** Proving the check can fail means
+actually making it fail, so one verified write is four writes to the live game: the target
+value, a poison value (`target + 1234`), and the final value — with the poison visible in
+the game for roughly half a second while the bridge round-trips. That is fine for a config
+field and not fine for health, position, or anything the game consumes every tick. Read the
+property first and decide whether the excursion is acceptable before you write it.
+
 ## Tests
 
 The verification logic runs off-engine, against a simulated game that can be told to lie:
@@ -162,7 +176,15 @@ Each of these was paid for:
 
 - **The command file is never rewound.** A line cursor is set to the file's current length at load, so commands left over from a previous session are not replayed. Without this, whoever starts the game executes the leftovers — a stale write lands minutes after anyone asked for it, and the symptom looks nothing like the cause.
 - **`resolve` caches, re-validates on every hit, and refuses to scan by default.** The engine recycles object slots, so a pointer that still passes `IsValid()` can belong to something else; the cached name is checked again before use. `find` populates the cache from objects it is already holding, so the normal find-then-act flow does no scanning at all — measured at **7 resolve hits, 0 full scans** across a complete probe run. A cache miss returns an error telling you to call `find` first, rather than silently spending a frame hitch; `allow_scan=1` opts in. See the measurement below for why.
-- **The cache is dropped during travel.** Objects do not survive a level change, and a stale entry that happened to re-validate would hand back an object from the old world.
+- **The cache is dropped when the world changes, and the guard has a negative control.**
+  Objects do not survive a level change, and a stale entry that happened to re-validate
+  would hand back an object from the old world. The guard compares the world's full name
+  against the previous tick, because the obvious check does not work: `IsInSeamlessTravel`
+  is a plain C++ method, not a UFUNCTION, so reflection cannot reach it. Read as a
+  property it resolves to a userdata, and `userdata == true` is false forever — a guard
+  that could never fire, in a repository whose entire argument is that such a guard is
+  not a guard. `ping` now reports `travel_guard_alive`, which poisons the tracked world
+  name on every status call and requires the guard to trip.
 - **Arrays are tagged.** An empty Lua table is ambiguous between `{}` and `[]`; without a tag an empty result set serialises as an object and breaks the reader's indexing.
 - **Every command runs inside `pcall`.** A malformed request must not take the poll loop down with it.
 - **File names are pure ASCII.** Lua's `io.open` goes through the system ANSI codepage, and a non-ASCII path fails to open without saying so.

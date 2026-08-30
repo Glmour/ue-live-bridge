@@ -184,14 +184,69 @@ local function cacheSize()
     return n
 end
 
---- True while the world is mid-travel. Sweeping the object array here returns
---- garbage; better to refuse the command than to answer with nonsense.
-local function travelling()
+-- Track the world by name so a change can be detected without reflection.
+local LAST_WORLD = nil
+local WORLD_CHANGES = 0
+
+--- True when the object array should not be swept.
+---
+--- The obvious check -- reading UWorld::IsInSeamlessTravel -- does not work, and
+--- fails in the way this project exists to catch. It is a plain C++ method, not a
+--- UFUNCTION or UPROPERTY, so UE4SS reflection cannot see it; the earlier code
+--- also read it as a property rather than calling it. Both mistakes resolve to
+--- nil, `nil == true` is false, and pcall swallows the rest. The result was a
+--- guard that could never fire, sitting in a repository whose whole argument is
+--- that a check which cannot go red is not a check.
+---
+--- What replaces it is reflectable and observable: the world's full name, compared
+--- against the previous tick. A changed name means a different world, which is the
+--- thing the cache actually needs to know about. `world_changes` is reported by
+--- ping so this one is not a silent claim either.
+local function worldName()
     local w = UEHelpers.GetWorld()
-    if not valid(w) then return true end
-    local t = false
-    pcall(function() t = w.IsInSeamlessTravel == true end)
-    return t
+    if not valid(w) then return nil end
+    return fullName(w)
+end
+
+local function travelling()
+    local n = worldName()
+    if n == nil then return true end          -- no world: mid-transition or torn down
+    if LAST_WORLD == nil then LAST_WORLD = n; return false end
+    if n ~= LAST_WORLD then
+        LAST_WORLD = n
+        WORLD_CHANGES = WORLD_CHANGES + 1
+        return true                            -- refuse this tick, cache is dropped
+    end
+    return false
+end
+
+--- Negative control for the travel guard.
+---
+--- The guard this replaced was dead for months without anyone noticing, so this
+--- one ships with the means to prove it still fires: poison the tracked world
+--- name, call the guard, require it to trip, then restore. If this ever returns
+--- alive=false the guard has gone dead again and nothing it reports means
+--- anything. Reported by ping, so it is checked on every status call rather than
+--- only when someone remembers to.
+local function travelSelfTest()
+    local saved, savedN = LAST_WORLD, WORLD_CHANGES
+    LAST_WORLD = "poison-not-a-world"
+    local tripped = travelling()
+    LAST_WORLD, WORLD_CHANGES = saved, savedN
+    return tripped == true
+end
+
+--- Diagnostic: what the old reflection-based check actually yields. Kept so the
+--- claim above is checkable rather than asserted.
+local function travelProbe()
+    local w = UEHelpers.GetWorld()
+    if not valid(w) then return { world = false } end
+    local ok, v = pcall(function() return w.IsInSeamlessTravel end)
+    local okc, vc = pcall(function() return w:IsInSeamlessTravel() end)
+    return {
+        prop_pcall_ok = ok, prop_type = type(v), prop_is_true = (v == true),
+        call_pcall_ok = okc, call_type = type(vc),
+    }
 end
 
 -- ── ops ─────────────────────────────────────────────────────────────────────
@@ -201,6 +256,8 @@ local OPS = {}
 function OPS.ping()
     local w = UEHelpers.GetWorld()
     return { ok = true, world = valid(w) and fullName(w) or nil, travelling = travelling(),
+             world_changes = WORLD_CHANGES, travel_guard_alive = travelSelfTest(),
+             travel_probe = travelProbe(),
              cached = cacheSize(), resolve_hits = STATS.resolve_hits,
              resolve_scans = STATS.resolve_scans, evictions = STATS.cache_evictions }
 end
@@ -225,42 +282,80 @@ function OPS.find(c)
     return { ok = true, count = n, objects = out }
 end
 
---- Measure what a cache miss actually costs on this game.
+--- Measure what a name lookup actually costs on this game.
 ---
---- `resolve` falls back to a linear sweep of the whole object array, calling
---- GetFullName on each entry until it matches. That is cheap on a corridor and
---- unknown on an open world, so measure it rather than guess: search for a name
---- that cannot exist, which forces the complete worst-case traversal.
+--- Three phases, so the cost can be attributed rather than guessed at:
+---   enum    -- FindAllOf(class) alone
+---   control -- a per-object call that crosses the Lua binding and does almost
+---              nothing (IsValid), isolating dispatch + loop overhead
+---   name    -- the same loop calling GetFullName and comparing
+--- name minus control is what the string work actually costs.
+---
+--- Timing note: os.clock() delegates to the CRT clock(), and MSVC's clock()
+--- returns wall-clock time since process start, not CPU time -- it deliberately
+--- does not follow ISO C here. CLOCKS_PER_SEC is 1000, so resolution is 1 ms and
+--- every phase is averaged over several rounds to keep quantisation from
+--- dominating a single reading.
 function OPS.bench(c)
     if travelling() then return { ok = false, err = "world is travelling" } end
 
-    local t0 = os.clock()
-    local all, n = nil, 0
-    pcall(function() all = FindAllOf("Object") end)
-    if all then n = #all end
-    local t_enum = os.clock() - t0
+    local class  = c.class or "Object"
+    local rounds = math.min(tonumber(c.rounds) or 5, 20)
 
-    local rounds = math.min(tonumber(c.rounds) or 3, 10)
-    local worst, total = 0, 0
-    for _ = 1, rounds do
-        local t1 = os.clock()
-        pcall(function()
-            for i = 1, n do
-                if fullName(all[i]) == "\1no-such-object\1" then break end
-            end
-        end)
-        local dt = os.clock() - t1
-        total = total + dt
-        if dt > worst then worst = dt end
+    local function timed(fn)
+        local worst, total = 0, 0
+        for _ = 1, rounds do
+            local t = os.clock()
+            pcall(fn)
+            local dt = os.clock() - t
+            total = total + dt
+            if dt > worst then worst = dt end
+        end
+        return total / rounds, worst
     end
+
+    local all, n = nil, 0
+    local enum_avg, enum_worst = timed(function()
+        all = FindAllOf(class)
+        n = all and #all or 0
+    end)
+
+    if n == 0 then
+        return { ok = true, class = class, objects = 0,
+                 note = "no instances of that class" }
+    end
+
+    local ctrl_avg = timed(function()
+        for i = 1, n do
+            local v = all[i]
+            if v and v:IsValid() and false then break end
+        end
+    end)
+
+    local name_avg, name_worst = timed(function()
+        for i = 1, n do
+            if fullName(all[i]) == "no-such-object" then break end
+        end
+    end)
+
+    local function ms(x) return math.floor(x * 100000 + 0.5) / 100 end
+    local function us(x) return math.floor((x / n) * 100000000 + 0.5) / 100 end
 
     return {
         ok = true,
+        class = class,
         objects = n,
-        enum_ms = math.floor(t_enum * 100000 + 0.5) / 100,
-        scan_avg_ms = math.floor((total / rounds) * 100000 + 0.5) / 100,
-        scan_worst_ms = math.floor(worst * 100000 + 0.5) / 100,
         rounds = rounds,
+        enum_ms = ms(enum_avg),
+        enum_worst_ms = ms(enum_worst),
+        control_ms = ms(ctrl_avg),
+        name_ms = ms(name_avg),
+        name_worst_ms = ms(name_worst),
+        -- the part attributable to GetFullName itself, binding overhead removed
+        name_minus_control_ms = ms(name_avg - ctrl_avg),
+        us_per_obj_control = us(ctrl_avg),
+        us_per_obj_name = us(name_avg),
+        us_per_obj_delta = us(name_avg - ctrl_avg),
         cached = cacheSize(),
     }
 end
@@ -352,8 +447,19 @@ local function pump()
     local f = io.open(CFG.cmd_file, "r")
     if not f then return end
 
+    -- Read whole, then split, so a half-written line is not consumed. f:lines()
+    -- yields a trailing partial line as if it were complete; the cursor would
+    -- advance past it and the command would be skipped forever once the writer
+    -- finished it, showing up only as an unexplained timeout on the other side.
+    local blob = f:read("a") or ""
+    f:close()
+    local lines = {}
+    for line in blob:gmatch("([^
+]*)
+") do lines[#lines + 1] = line end
+
     local n = 0
-    for line in f:lines() do
+    for _, line in ipairs(lines) do
         n = n + 1
         if n > cursor and #line > 2 then
             cursor = n
@@ -372,7 +478,6 @@ local function pump()
         end
     end
     if n < cursor then cursor = n end   -- writer truncated the file; resync
-    f:close()
 end
 
 LoopInGameThreadWithDelay(CFG.tick_ms, function()
