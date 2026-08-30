@@ -1,12 +1,47 @@
 # ue-live-bridge
 
-**Drive a running Unreal Engine game from outside — and find out whether what you asked for actually happened.**
+**Every check you rely on could be dead. This one poisons itself to prove it isn't — demonstrated against a commercial game, because a running game is a state you cannot fake.**
 
-A [UE4SS](https://github.com/UE4SS-RE/RE-UE4SS) Lua mod exposes the live game over a pair of append-only files. A Python driver on the other side reads and writes UObject properties, calls UFunctions, and — the part that matters — refuses to report success it cannot prove.
+Automated callers report success they did not achieve. Measurably: **45–48%** of agent failures close with the agent asserting it finished, **75.8%** of explicit success flags written by coding agents were wrong, and LLM judges catch neither — no configuration across five judges exceeded AUROC 0.65 ([arXiv:2606.09863](https://arxiv.org/abs/2606.09863)).
 
-It speaks MCP, so an agent can drive the game directly — and the write tool
-returns a verdict rather than a boolean, so an agent cannot report a state
-change it did not make.
+The standard fix is to assert a postcondition against the authoritative record, from a process the caller cannot write to. That is right, and it is not enough: **a postcondition that can never fail is indistinguishable from one that passes.** Nobody checks the checker.
+
+So this harness poisons every check on purpose and requires it to go red. A check that survives its own poison is reported as a harness failure, not as a passing test.
+
+## Thirty seconds, no game required
+
+```bash
+git clone https://github.com/Glmour/ue-live-bridge && cd ue-live-bridge
+python drive.py demo
+```
+
+```
+Four bridges. Every one of them reports that the write succeeded.
+
+  bridge             what it does                           verdict              caught by
+  -----------------  -------------------------------------  -------------------  ----------------------------------
+  honest bridge      writes land                            CONFIRMED            -
+  silent drop        acks the write, changes nothing        FALSE_SUCCESS        the independent re-read
+  inconsistent liar  fakes the read but not the write site  INCONSISTENT_BRIDGE  cross-channel agreement
+  stale reader       both channels agree; reads are cached  DEAD_CHECK           the negative control, and nothing else
+```
+
+Standard library only, nothing to install. Each lie is stopped by a different layer, and the last row is the point: both channels agree, every assertion passes, and **only poisoning the check exposes it**.
+
+The demo is also its own negative control — it asserts the expected verdict for every row and exits non-zero if the harness ever stops catching a liar. Break the poison step and this is what you get instead, which is exactly the failure the tool exists to prevent:
+
+```
+  stale reader       both channels agree; reads are cached  CONFIRMED            !! expected DEAD_CHECK
+
+  1 scenario(s) did not produce the expected verdict.
+  That is this demo failing its own negative control.
+```
+
+`--verbose` prints the eight steps behind each verdict.
+
+## The same harness against a running game
+
+A [UE4SS](https://github.com/UE4SS-RE/RE-UE4SS) Lua mod exposes the live game over a pair of append-only files. A Python driver on the other side reads and writes UObject properties, calls UFunctions, and — the part that matters — refuses to report success it cannot prove. It speaks MCP, so an agent can drive the game directly, and the write tool returns a verdict rather than a boolean.
 
 No engine source, no game source, no C++, no sockets.
 
@@ -34,19 +69,19 @@ $ python drive.py --data "<game>/Binaries/Win64/ue4ss/Mods/GameBridge/data" prob
 Chain verified end to end, and the check is provably alive.
 ```
 
-That is a real transcript against The Exit 8, not a mock.
+That is a real transcript against The Exit 8 (UE 5.2), not a mock.
+
+**Why demonstrate this on a game?** Verification claims are usually shown on synthetic benchmarks, where the authoritative state is whatever the benchmark says it is. A running commercial game is adversarial in the way that matters: you do not own the state, you cannot fake it, it recycles object slots underneath you, and it will happily report that a write landed when it did not. Every failure mode in the demo above was met here first.
 
 ---
 
 ## Why steps 6 and 7 exist
 
-Automated callers — agents especially — report success they did not achieve. This is measured, not folklore. [*From Confident Closing to Silent Failure*](https://arxiv.org/abs/2606.09863) (arXiv:2606.09863) went through 9,876 tau2-bench and 1,879 AppWorld trajectories and found that **45–48% of failures in single-control domains end with the agent asserting it finished**, and separately that **75.8% of explicit success flags written by coding agents were wrong** — two different denominators, same conclusion. LLM judges do not catch it: no configuration across five judges and five prompt strategies exceeded AUROC 0.65, and on raw call traces they reached 0.54, roughly a coin flip, because judges reward assertion vocabulary rather than verified state change.
+The figures in the opening come from [*From Confident Closing to Silent Failure*](https://arxiv.org/abs/2606.09863), across 9,876 tau2-bench and 1,879 AppWorld trajectories. The same paper carries the number that shaped this tool: in its one dual-control domain, where a second party independently confirms the state change, false success drops to **3%**. A 15x difference from architecture rather than from a better model.
 
-The same paper contains the number that shaped this tool: in the one dual-control domain, where a second party independently confirms the state change, false success drops to **3%**. That is a 15x difference from architecture rather than from a better model.
+Step 5 is that second party — a postcondition read through a handle the actor does not write to.
 
-The standard fix is right as far as it goes: assert a postcondition against the authoritative record, from a process the caller cannot write to. This tool does that at step 5.
-
-But a postcondition that can never fail is indistinguishable from one that passes, and dead checks are common — a comparison lost in a refactor, an exception swallowed into a `True`, a field name that silently resolves to something else. So step 7 poisons the world and requires the check to notice. **A check that survives its own poison is reported as a harness failure, not as a passing test.**
+Step 7 is the part nobody does. Dead checks are ordinary: a comparison lost in a refactor, an exception swallowed into a `True`, a field name that silently resolves to something else. A guard that cannot fail looks exactly like a guard that passes, so step 7 poisons the world and requires the check to notice.
 
 ### The bug this design found in itself
 
@@ -67,7 +102,7 @@ Two rules came out of that, and they are the whole design now:
 
 ## Verdicts
 
-The CLI and the MCP tool report the same five verification outcomes.
+The CLI and the MCP tool report the same six verification outcomes.
 
 | MCP `verdict` | CLI line | Meaning | Exit |
 |---|---|---|---|
@@ -76,14 +111,17 @@ The CLI and the MCP tool report the same five verification outcomes.
 | `INCONSISTENT_BRIDGE` | INCONSISTENT BRIDGE | Write site and re-read disagree; no verdict is available | 1 |
 | `WITHHELD` | VERDICT WITHHELD | The poison never applied, so the apparent pass is unproven | 1 |
 | `DEAD_CHECK` | DEAD CHECK | The check survived a poison that provably landed | 1 |
+| `POISON_STUCK` | POISON STUCK | Everything verified, but the restore did not take and the game is still holding the poison | 1 |
 
 The MCP tool adds two that come before verification can even start: `UNREADABLE`
 (the property could not be read) and `WRITE_REJECTED` (the bridge refused the write),
 plus `HONEST FAILURE` on the CLI when the bridge reports the write failed and does not
 pretend otherwise.
 
-Only the first is a success. The other four are distinct facts, and collapsing
-them into "failed" throws away the part that tells you what to do next.
+Only the first is a success. The rest are distinct facts, and collapsing them
+into "failed" throws away the part that tells you what to do next. `POISON_STUCK`
+in particular is not a verification result at all — it is the harness reporting
+that it left a mess, which is the one thing worse than a wrong verdict.
 
 ## Install
 
@@ -143,12 +181,24 @@ property first and decide whether the excursion is acceptable before you write i
 The verification logic runs off-engine, against a simulated game that can be told to lie:
 
 ```bash
-python test/spike_test.py                              # 4 scenarios, no game needed
-python test/mcp_test.py                                # MCP verdicts, all three bridges
+python drive.py demo                                   # four bridges end to end, no game
+python test/spike_test.py                              # verification logic in isolation
+python test/mcp_test.py                                # the same four bridges through MCP
+python test/lua_syntax.py --self-test                  # the syntax checker, on a broken file
 python test/fake_bridge.py --data ./_t --lie           # then: python drive.py --data ./_t probe
 ```
 
-`fake_bridge.py` reproduces both failure modes on demand (`--lie`, `--deadcheck`), which is how the design flaw above was found and how the fix was confirmed.
+`fake_bridge.py` reproduces every failure mode on demand: `--lie` drops writes
+silently, `--deadcheck` additionally fakes the read-back, and `--stale-reads`
+serves both channels a consistent story from a cache — the only one of the three
+that the negative control alone can catch. The first two are how the design flaw
+below was found; the third is what proves the fix still works.
+
+Every check in this repository is required to fail on demand, including the ones
+that check the checks. `lua_syntax.py --self-test` feeds itself deliberately
+broken Lua and fails if it does not go red — it was written because the previous
+syntax check reported `OK` for every file, good or broken, and had been doing so
+for an entire session.
 
 
 ## What a cache miss actually costs

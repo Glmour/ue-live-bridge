@@ -30,10 +30,26 @@ class Bridge(Protocol):
 
 
 class Verdict(str, Enum):
+    """The vocabulary every caller reports in.
+
+    One list, because three copies of it drifted apart once already: the CLI
+    printed prose, the MCP tool returned bare strings, and only this module had
+    an enum. A caller that has to translate between them will eventually
+    translate WITHHELD into "succeeded".
+    """
+
     CONFIRMED = "CONFIRMED"      # the agent claimed success and the world agrees
     FALSE_SUCCESS = "FALSE_SUCCESS"   # the agent claimed success, the world disagrees
     HONEST_FAILURE = "HONEST_FAILURE"  # the agent reported failure; not our problem
     DEAD_CHECK = "DEAD_CHECK"    # the postcondition survived its own poison
+
+    # Reachable only when driving a real bridge, so they live outside the
+    # Verifier above -- but they are verdicts, and they belong in one list.
+    INCONSISTENT_BRIDGE = "INCONSISTENT_BRIDGE"  # two channels disagree; neither can arbitrate
+    WITHHELD = "WITHHELD"        # the poison never landed; the pass is unproven
+    UNREADABLE = "UNREADABLE"    # could not read the property at all
+    WRITE_REJECTED = "WRITE_REJECTED"  # the bridge refused the write, and said so
+    POISON_STUCK = "POISON_STUCK"  # verification ran, but the world was left poisoned
 
 
 @dataclass

@@ -2,8 +2,9 @@
 Verify that write_property returns the right verdict for each kind of bridge.
 
 The tool's whole value is that it will not say CONFIRMED unless it earned it, so
-this drives it against a bridge that is honest, one that lies, and one that lies
-about the read-back too, and asserts the verdict each time.
+this drives it against four bridges -- honest, silently dropping writes, lying
+about the read-back, and serving stale reads -- and asserts the verdict each
+time. The last one is the only case the negative control alone can catch.
 
     python test/mcp_test.py
 """
@@ -26,6 +27,8 @@ CASES = [
     ("honest bridge",              [],                        "CONFIRMED"),
     ("lying bridge",               ["--lie"],                 "FALSE_SUCCESS"),
     ("lying bridge + faked reads", ["--lie", "--deadcheck"],  "INCONSISTENT_BRIDGE"),
+    # Both channels agree and every assertion passes. Only the poison exposes it.
+    ("stale reader",               ["--stale-reads"],         "DEAD_CHECK"),
 ]
 
 failures: list[str] = []

@@ -24,6 +24,7 @@ from typing import Any
 from mcp.server.mcpserver import MCPServer
 
 from drive import FileBridge
+from verify import Verdict
 
 DATA_DIR = os.environ.get("UE_LIVE_BRIDGE_DATA", "")
 
@@ -41,7 +42,9 @@ server = MCPServer(
         "causes: a channel is lying, or the property is volatile and the game "
         "rewrote it between the two reads. Retrying helps with neither, but the "
         "second is not a bug -- check whether the game owns that field before "
-        "concluding the bridge is broken."
+        "concluding the bridge is broken. POISON_STUCK means the write worked "
+        "but verification left a poison value live in the game: say so to the "
+        "user and fix that before doing anything else with that property."
     ),
 )
 
@@ -89,7 +92,9 @@ def call_function(obj: str, fn: str) -> dict:
         "value, then a poison value (target + 1234) to prove the check can fail, "
         "then the final value. The poison is live in the game for roughly half a "
         "second. Do not point this at a property the game consumes continuously "
-        "(health, position, timers) unless that excursion is acceptable."
+        "(health, position, timers) unless that excursion is acceptable. The "
+        "restore is read back, so POISON_STUCK is reported rather than left "
+        "for the game to discover."
     )
 )
 def write_property(obj: str, prop: str, value: float) -> dict:
@@ -109,13 +114,14 @@ def write_property(obj: str, prop: str, value: float) -> dict:
 
     before = b.send(op="read", obj=obj, prop=prop)
     if not before.get("ok"):
-        return {"verdict": "UNREADABLE", "detail": before.get("err", "read failed")}
+        return {"verdict": Verdict.UNREADABLE.value,
+                "detail": before.get("err", "read failed")}
     original = before["value"]
 
     w = b.send(op="write", obj=obj, prop=prop, value=value)
     if not w.get("ok"):
-        return {"verdict": "WRITE_REJECTED", "detail": w.get("err", "write failed"),
-                "original": original}
+        return {"verdict": Verdict.WRITE_REJECTED.value,
+                "detail": w.get("err", "write failed"), "original": original}
 
     def near(a: Any, x: float) -> bool:
         return isinstance(a, (int, float)) and abs(float(a) - x) < 1e-6
@@ -127,7 +133,7 @@ def write_property(obj: str, prop: str, value: float) -> dict:
 
     if landed_at_write != holds:
         return {
-            "verdict": "INCONSISTENT_BRIDGE",
+            "verdict": Verdict.INCONSISTENT_BRIDGE.value,
             "detail": "the write site and an independent re-read disagree about "
                       "whether the value changed. Either a channel is lying, or "
                       "the game rewrote a volatile property between the two reads; "
@@ -139,7 +145,7 @@ def write_property(obj: str, prop: str, value: float) -> dict:
 
     if not holds:
         return {
-            "verdict": "FALSE_SUCCESS",
+            "verdict": Verdict.FALSE_SUCCESS.value,
             "detail": "the bridge accepted the write but the value did not change; "
                       "both channels agree",
             "observed": r.get("value"),
@@ -153,27 +159,47 @@ def write_property(obj: str, prop: str, value: float) -> dict:
     pr = b.send(op="read", obj=obj, prop=prop)
     noticed = not (pr.get("ok") and near(pr.get("value"), value))
 
-    b.send(op="write", obj=obj, prop=prop, value=original if _restore_original else value)
+    want_final = original if _restore_original else value
+    b.send(op="write", obj=obj, prop=prop, value=want_final)
+    # The negative control left a poison value in a live game. Whether it came
+    # back out is a fact the caller has to have, so the cleanup is read back
+    # rather than assumed -- an unchecked restore is a dead check of its own.
+    fr = b.send(op="read", obj=obj, prop=prop)
+    left_holding = fr.get("value") if fr.get("ok") else None
+    still_poisoned = fr.get("ok") and near(fr.get("value"), poison)
 
     if not poison_landed:
         return {
-            "verdict": "WITHHELD",
+            "verdict": Verdict.WITHHELD.value,
             "detail": "the poison never applied, so the check was never shown to be "
                       "capable of failing; the apparent success is unproven",
             "original": original,
+            "world_left_holding": left_holding,
         }
     if not noticed:
         return {
-            "verdict": "DEAD_CHECK",
+            "verdict": Verdict.DEAD_CHECK.value,
             "detail": "the check survived a poison that provably landed; it cannot "
-                      "distinguish success from failure and its verdict means nothing",
+                      "distinguish success from failure and its verdict means nothing. "
+                      "Reads through this bridge cannot be trusted, so the value "
+                      "reported below is itself suspect",
             "original": original,
+            "world_left_holding": left_holding,
+        }
+    if still_poisoned:
+        return {
+            "verdict": Verdict.POISON_STUCK.value,
+            "detail": "the write landed and the check is alive, but the restore did "
+                      "not take: the game is holding the poison value. Fix this "
+                      "before anything else reads that property",
+            "original": original,
+            "poison_value": poison,
         }
 
     return {
-        "verdict": "CONFIRMED",
+        "verdict": Verdict.CONFIRMED.value,
         "detail": "independently observed, and the check was proven able to fail",
-        "value": value,
+        "value": want_final,
         "original": original,
     }
 
