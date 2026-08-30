@@ -35,7 +35,7 @@ Ten bridges. All but one of them report a write that succeeded.
 
 Standard library only, nothing to install, about two seconds. Each bridge is stopped by a different layer, and **`stale reader` is the one to look at**: both channels agree, every assertion passes, and only poisoning the check on purpose exposes it.
 
-The demo is also its own negative control. It asserts the expected verdict for every row, and every verdict the harness can produce appears in the table — so disabling any one guard turns this red rather than leaving it quietly wrong. Break the poison step, for instance, and the stale reader collects a confident pass:
+The demo is also its own negative control. It asserts the expected verdict for every row, and every verdict reachable *from a write* appears in the table — so disabling any one of those guards turns this red rather than leaving it quietly wrong. (`UNREADABLE` and `WRITE_REJECTED` come before a write is attempted and are covered by `test/edge_test.py` and `test/mcp_test.py` instead.) Break the poison step, for instance, and the stale reader collects a confident pass:
 
 ```
   stale reader       both channels agree; reads are cached  CONFIRMED            !! expected DEAD_CHECK
@@ -121,7 +121,9 @@ The CLI and the MCP tool report the same seven verification outcomes.
 | `WITHHELD` | VERDICT WITHHELD | The poison never applied, so the apparent pass is unproven | 1 |
 | `DEAD_CHECK` | DEAD CHECK | The check survived a poison that provably landed | 1 |
 | `POISON_STUCK` | POISON STUCK | Everything verified, but the restore did not take and the game is still holding the poison | 1 |
-| `RESTORE_UNVERIFIED` | RESTORE UNVERIFIED | The cleanup could not be read back, so whether the poison is out is unknown | 1 |
+| `RESTORE_UNVERIFIED` | RESTORE UNVERIFIED | The cleanup did not come back clean. `phase: "interrupted"` — verification stopped partway and there is no verdict about the write at all; `phase: "cleanup"` — the write and the check both verified and only the tidy-up is unaccounted for | 1 |
+
+The `cleanup` block that comes with the last three carries one of four states, and the fourth exists because the first three were not enough: `restored` (the value we wrote is there), `poisoned` (the poison still is), `diverged` (the read *worked* and returned a third value — something else owns that property, and the poison is provably out), `unknown` (the read did not work, so nothing is known). Folding `diverged` into `unknown` made both front ends report "could not be read back" about a read that had succeeded.
 
 The MCP tool adds two that come before verification can even start: `UNREADABLE`
 (the property could not be read) and `WRITE_REJECTED` (the bridge refused the write),
@@ -194,7 +196,9 @@ The verification logic runs off-engine, against a simulated game that can be tol
 python drive.py demo                                   # ten bridges end to end, no game
 python test/poison_test.py                             # the poison chooser, on its own
 python test/spike_test.py                              # verification logic in isolation
-python test/mcp_test.py                                # the same four bridges through MCP
+python test/mcp_test.py                                # the same bridges through MCP
+python test/edge_test.py                               # float32, nil reads, Ctrl-C
+python test/poison_test.py                             # the poison chooser, on its own
 python test/lua_syntax.py --self-test                  # the syntax checker, on a broken file
 python test/fake_bridge.py --data ./_t --lie           # then: python drive.py --data ./_t probe
 ```

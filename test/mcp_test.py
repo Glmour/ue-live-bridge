@@ -2,7 +2,8 @@
 Verify that write_property returns the right verdict for each kind of bridge.
 
 The tool's whole value is that it will not say CONFIRMED unless it earned it, so
-this drives it against four bridges -- honest, silently dropping writes, lying
+this drives it against every bridge the simulator can be -- honest, silently
+dropping writes, lying
 about the read-back, and serving stale reads -- and asserts the verdict each
 time. The last one is the only case the negative control alone can catch.
 
@@ -36,7 +37,16 @@ CASES = [
     ("poison refused",             ["--refuse-nth-write", "2"],   "WITHHELD"),
     ("restore refused",            ["--refuse-nth-write", "3"],   "POISON_STUCK"),
     ("cleanup unreadable",         ["--vanish-after-write", "3"], "RESTORE_UNVERIFIED"),
+    # A property that is currently nil: the Lua side sends ok:true with no
+    # `value` key at all, because jval drops nil-valued keys. Both front ends
+    # used to raise KeyError on it, and a traceback is not a verdict.
+    ("property reads as nil",      ["--nil-value"],               "UNREADABLE"),
 ]
+
+# Values no comparison can verify afterwards, refused before anything is
+# written. The guard for this was unreachable when first added: inf and nan
+# died at an earlier check, so it could never fire.
+NONFINITE = [("+inf", float("inf")), ("nan", float("nan"))]
 
 failures: list[str] = []
 
@@ -76,10 +86,27 @@ def run_case(label: str, flags: list[str], want: str, i: int) -> None:
         data.rmdir()
 
 
+def run_nonfinite(label: str, value: float) -> None:
+    """No bridge needed: this is refused before a single command is sent."""
+    for m in ("mcp_server", "drive"):
+        sys.modules.pop(m, None)
+    import mcp_server
+    mcp_server.DATA_DIR = str(ROOT / "_nonexistent_on_purpose")
+    mcp_server._bridge = None
+    got = mcp_server.write_property(OBJ, PROP, value)
+    ok = got.get("verdict") == "WITHHELD"
+    print(f"  {'PASS ' if ok else 'FAIL '} refuses to write {label:<14} -> "
+          f"{got.get('verdict')}")
+    if not ok:
+        failures.append(f"non-finite {label}")
+
+
 def main() -> int:
     print("write_property verdict test\n" + "=" * 60)
     for i, (label, flags, want) in enumerate(CASES):
         run_case(label, flags, want, i)
+    for label, value in NONFINITE:
+        run_nonfinite(label, value)
     print("=" * 60)
     if failures:
         print(f"FAILED: {', '.join(failures)}")

@@ -23,7 +23,7 @@ from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 
-from drive import FileBridge, poison_for, restore_and_check
+from drive import FileBridge, near, poison_for, restore_and_check
 from verify import Verdict
 
 DATA_DIR = os.environ.get("UE_LIVE_BRIDGE_DATA", "")
@@ -45,6 +45,9 @@ server = MCPServer(
         "concluding the bridge is broken. POISON_STUCK means the write worked "
         "but verification left a poison value live in the game: say so to the "
         "user and fix that before doing anything else with that property. "
+        "RESTORE_UNVERIFIED carries a `phase`: \"interrupted\" means no verdict "
+        "about the write is available at all, \"cleanup\" means the write and "
+        "the check both verified and only the tidy-up is unaccounted for. "
         "WITHHELD also covers a value so large that no poison can be told "
         "apart from it in float64 -- the write may have landed, but nothing "
         "proved the check could have said otherwise."
@@ -93,7 +96,8 @@ def call_function(obj: str, fn: str) -> dict:
         "treated as not having happened. "
         "SIDE EFFECT: verification performs FOUR writes, not one -- the target "
         "value, then a poison value (offset from the target, scaled to its "
-        "magnitude) to prove the check can fail, then the final value. The poison is live in the game for roughly half a "
+        "magnitude) to prove the check can fail, then the final value -- three "
+        "writes in total. The poison is live in the game for roughly half a "
         "second. Do not point this at a property the game consumes continuously "
         "(health, position, timers) unless that excursion is acceptable. The "
         "restore is read back, so POISON_STUCK is reported rather than left "
@@ -113,13 +117,36 @@ def write_property(obj: str, prop: str, value: float) -> dict:
     "unverified" and "failed" are different facts and collapsing them is how
     a caller ends up confidently wrong.
     """
+    # Refused before anything is sent, not after the first read: this is input
+    # validation, and a value no comparison can verify afterwards has no
+    # business reaching a live game at all. It also makes the poison_for(None)
+    # branch below reachable -- it never was, because inf and nan died at the
+    # `holds` check further down. A guard nothing could kill, added in the
+    # commit whose message was about exactly that.
+    if isinstance(value, float) and (value != value or value in (
+            float("inf"), float("-inf"))):
+        return {
+            "verdict": Verdict.WITHHELD.value,
+            "detail": f"refusing to write {value} -- no comparison can verify a "
+                      "non-finite value afterwards, so nothing was written",
+        }
+
     b = bridge()
 
     before = b.send(op="read", obj=obj, prop=prop)
     if not before.get("ok"):
         return {"verdict": Verdict.UNREADABLE.value,
                 "detail": before.get("err", "read failed")}
-    original = before["value"]
+    original = before.get("value")
+    if "value" not in before:
+        # ok:true with no value key. The Lua side emits exactly this for a
+        # property that is currently nil, and jval drops nil-valued keys -- so a
+        # real bridge produces it routinely and both front ends used to raise
+        # KeyError. A crash is not a verdict.
+        return {"verdict": Verdict.UNREADABLE.value,
+                "detail": "the bridge answered ok but sent no value; the property "
+                          "is probably nil on this object"}
+
 
     w = b.send(op="write", obj=obj, prop=prop, value=value)
     if not w.get("ok"):
@@ -133,9 +160,6 @@ def write_property(obj: str, prop: str, value: float) -> dict:
                 "detail": "the bridge reported that the write did not succeed, and "
                           "did not claim otherwise; nothing to catch here -- fix the write",
                 "original": original}
-
-    def near(a: Any, x: float) -> bool:
-        return isinstance(a, (int, float)) and abs(float(a) - x) < 1e-6
 
     landed_at_write = near(w.get("after"), value)
 
@@ -192,10 +216,17 @@ def write_property(obj: str, prop: str, value: float) -> dict:
         poison_landed = near(pw.get("after"), poison)
         pr = b.send(op="read", obj=obj, prop=prop)
         noticed = not (pr.get("ok") and near(pr.get("value"), value))
-    except Exception as e:
+    except BaseException as e:
+        # BaseException, not Exception. KeyboardInterrupt is not an Exception,
+        # and Ctrl-C during the poll -- what someone does when the game hitches
+        # -- used to skip the restore and leave the poison live. The cleanup runs
+        # either way; an interrupt is then re-raised rather than swallowed.
         cleanup = restore_and_check(b, obj, prop, want_final, poison)
+        if not isinstance(e, Exception):
+            raise
         return {
             "verdict": Verdict.RESTORE_UNVERIFIED.value,
+            "phase": "interrupted",
             "detail": f"verification failed partway through ({type(e).__name__}: {e}). "
                       "A poison value may have been written; see cleanup",
             "original": original, "poison_value": poison, "cleanup": cleanup,
@@ -238,10 +269,15 @@ def write_property(obj: str, prop: str, value: float) -> dict:
         # catch: turning "I could not tell" into "it worked".
         return {
             "verdict": Verdict.RESTORE_UNVERIFIED.value,
-            "detail": "the write and the check both verified, but the cleanup could "
-                      "not be read back, so whether the poison is still in the game "
-                      "is unknown. Treat that property as suspect until you have "
-                      "read it yourself",
+            "phase": "cleanup",
+            "detail": ("the write and the check both verified and the poison is "
+                       "provably out, but the property now holds a third value -- "
+                       "something else writes it"
+                       if cleanup["state"] == "diverged" else
+                       "the write and the check both verified, but the cleanup could "
+                       "not be read back, so whether the poison is still in the game "
+                       "is unknown. Treat that property as suspect until you have "
+                       "read it yourself"),
             "original": original, "poison_value": poison, "cleanup": cleanup,
         }
 

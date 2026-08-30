@@ -51,6 +51,7 @@ def run(
     wrote_false: bool = False,
     refuse_nth_write: int = 0,
     vanish_after_write: int = 0,
+    nil_value: bool = False,
     ready: threading.Event | None = None,
 ) -> None:
     """Serve the two-file protocol until `stop` is set (or forever, if None)."""
@@ -111,6 +112,14 @@ def run(
             elif op == "read":
                 if vanish_after_write and writes >= vanish_after_write:
                     out = {"ok": False, "err": "object not found"}
+                    out["id"] = c.get("id")
+                    reply(out)
+                    continue
+                if nil_value:
+                    # What the Lua side really sends for a property that is
+                    # currently nil: jval drops nil-valued keys, so `ok` is true
+                    # and `value` is simply absent.
+                    out = {"ok": True, "vtype": "nil"}
                     out["id"] = c.get("id")
                     reply(out)
                     continue
@@ -177,7 +186,8 @@ if __name__ == "__main__":
     ap.add_argument("--wrote-false", action="store_true")
     ap.add_argument("--refuse-nth-write", type=int, default=0)
     ap.add_argument("--vanish-after-write", type=int, default=0)
+    ap.add_argument("--nil-value", action="store_true")
     a = ap.parse_args()
     run(Path(a.data), a.lie, a.deadcheck, stale_reads=a.stale_reads,
         wrote_false=a.wrote_false, refuse_nth_write=a.refuse_nth_write,
-        vanish_after_write=a.vanish_after_write)
+        vanish_after_write=a.vanish_after_write, nil_value=a.nil_value)

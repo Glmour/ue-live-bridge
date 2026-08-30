@@ -3,7 +3,7 @@ Drive the in-game bridge from outside.
 
 Commands: demo, ping, find, read, bench, and probe.
 
-`demo` needs no game and no arguments -- it runs the verification against three
+`demo` needs no game and no arguments -- it runs the verification against ten
 bridges, most of which lie, and shows which claims survive.
 
     python drive.py demo
@@ -88,7 +88,22 @@ class FileBridge:
 
 
 def near(a: object, x: float) -> bool:
-    return isinstance(a, (int, float)) and abs(float(a) - x) < 1e-6
+    """Equal, allowing for the quantisation a real property applies.
+
+    The tolerance used to be a flat 1e-6, which convicts honest bridges. Most UE
+    float properties are float32: ask for 250.3 and the game stores
+    250.3000030518, three times that tolerance away. Both channels then agree
+    the value "did not change", and the verdict is FALSE_SUCCESS against a
+    bridge that wrote exactly what it was told. Four of seven everyday values
+    tested that way -- a systematic false accusation on the tool's main use.
+
+    Relative from here up, absolute near zero. float32 carries about seven
+    significant digits, so 1e-6 of the magnitude clears its rounding with room
+    while staying far tighter than any real change anyone writes.
+    """
+    if not isinstance(a, (int, float)) or isinstance(a, bool):
+        return False
+    return abs(float(a) - x) <= max(1e-6, abs(x) * 1e-6)
 
 
 def poison_for(value: float, avoid: tuple[float, ...] = ()) -> float | None:
@@ -132,21 +147,44 @@ def poison_for(value: float, avoid: tuple[float, ...] = ()) -> float | None:
     return None
 
 
+def target_for(original: float) -> float:
+    """A write value that is provably a change from what is already there.
+
+    A flat +7 is not one. At 1e20 the sum IS the original, so the demo row that
+    reads "writes land on a 1e20 property" was verifying a write of the value
+    already present -- the label and the evidence disagreed, and nothing said so.
+    Same lesson as poison_for, one line further up.
+    """
+    o = float(original)
+    step = max(7.0, abs(o) * 1e-4)
+    for mult in (1, 8, 64, 512, 4096):
+        cand = o + step * mult
+        if not near(cand, o):
+            return cand
+    return o + step * 32768
+
+
 def restore_and_check(b: FileBridge, obj: str, prop: str,
                       want: float, poison: float) -> dict:
     """Put the value back and find out whether it went back.
 
-    Returns one of three states, never a boolean. `unknown` exists because a
-    read that fails is not a world that is clean, and the two must not share a
-    name -- collapsing them is how an unreadable cleanup gets reported as a
-    verified one.
+    Four states, never a boolean:
+
+      restored  the value we wrote is what is there
+      poisoned  the poison is still there
+      diverged  the read WORKED and returned a third value -- something else
+                owns this property. The poison is provably out, which
+                `unknown` does not say
+      unknown   the read did not work, so nothing is known either way
+
+    `diverged` exists because the first version folded it into `unknown`, and
+    both callers then printed "the cleanup could not be read back" about a read
+    that had succeeded. Four facts in three names is the thing this file spends
+    its whole time telling other people not to do.
 
     Lives here rather than in each caller because the CLI and the MCP tool
     already drifted apart once on logic they had both hand-written.
     """
-    def near(a: object, x: float) -> bool:
-        return isinstance(a, (int, float)) and abs(float(a) - x) < 1e-6
-
     out: dict = {"state": "unknown", "wanted": want}
     try:
         w = b.send(op="write", obj=obj, prop=prop, value=want)
@@ -165,8 +203,8 @@ def restore_and_check(b: FileBridge, obj: str, prop: str,
         out["state"] = "poisoned"
     elif near(r.get("value"), want):
         out["state"] = "restored"
-    # else: neither the value we wrote nor the poison. Something else owns this
-    # property, which is worth saying rather than rounding to "restored".
+    else:
+        out["state"] = "diverged"
     return out
 
 
@@ -200,13 +238,19 @@ def probe(b: FileBridge, cls: str, prop: str) -> Verdict | None:
         # other -- the drift that sharing a verdict vocabulary was meant to end.
         print(f"    unreadable: {r3.get('err', 'read failed')}")
         return Verdict.UNREADABLE
+    if "value" not in r3:
+        # ok:true with no value key -- what the Lua side emits for a property
+        # that is currently nil, because jval drops nil-valued keys. A real
+        # bridge produces it routinely, and this used to raise KeyError.
+        print("    the bridge answered ok but sent no value (property is nil?)")
+        return Verdict.UNREADABLE
     original = r3["value"]
     print(f"    {prop} = {original!r}")
     if not isinstance(original, (int, float)):
         print("    need a numeric property for the write test")
         return None
 
-    target = float(original) + 7.0
+    target = target_for(original)
     print(f"\n[4] write {prop} <- {target}")
     w = b.send(op="write", obj=obj, prop=prop, value=target)
     claimed = bool(w.get("wrote"))
@@ -218,13 +262,13 @@ def probe(b: FileBridge, cls: str, prop: str) -> Verdict | None:
     # it disagrees with the re-read below, one of the two is fabricated, and
     # that disagreement is worth more than either reading alone.
     landed_at_write = (
-        isinstance(w_after, (int, float)) and abs(float(w_after) - target) < 1e-6
+        near(w_after, target)
     )
 
     print(f"\n[5] postcondition: independent re-read")
     r5 = b.send(op="read", obj=obj, prop=prop)
     observed = r5.get("value") if r5.get("ok") else None
-    holds = isinstance(observed, (int, float)) and abs(float(observed) - target) < 1e-6
+    holds = near(observed, target)
     print(f"    re-read {prop} = {observed!r}  -> {'target' if holds else 'NOT target'}")
 
     print(f"\n[6] cross-channel agreement")
@@ -259,13 +303,13 @@ def probe(b: FileBridge, cls: str, prop: str) -> Verdict | None:
         pw = b.send(op="write", obj=obj, prop=prop, value=poison_val)
         poison_landed = (
             isinstance(pw.get("after"), (int, float))
-            and abs(float(pw["after"]) - poison_val) < 1e-6
+            and near(pw["after"], poison_val)
         )
         pr = b.send(op="read", obj=obj, prop=prop)
         if not pr.get("ok"):
             raise RuntimeError(pr.get("err", "read failed"))
         poisoned = pr["value"]
-        noticed = abs(float(poisoned) - target) >= 1e-6
+        noticed = not near(poisoned, target)
         print(f"    poison landed at write site: {poison_landed}")
         print(f"    re-read after poison: {poisoned!r}; check "
               f"{'went RED' if noticed else 'still passed'}")
@@ -274,14 +318,22 @@ def probe(b: FileBridge, cls: str, prop: str) -> Verdict | None:
     except Exception as e:
         interrupted = e
         print(f"    INTERRUPTED: {type(e).__name__}: {e}")
-
-    print(f"\n[8] restore")
-    cleanup = restore_and_check(b, obj, prop, original, poison_val)
+    finally:
+        # `finally`, not a trailing statement. The comment above said try/finally
+        # while the code was try/except, and the difference is exactly the case
+        # that matters: KeyboardInterrupt is not an Exception, so Ctrl-C during
+        # the eight-second poll -- which is precisely what someone does when the
+        # game hitches -- skipped the restore entirely and left the poison in a
+        # live game, silently. The one thing this tool promises never to do.
+        print(f"\n[8] restore")
+        cleanup = restore_and_check(b, obj, prop, original, poison_val)
     print(f"    {prop} = {cleanup.get('observed', '<unreadable>')!r}"
           f"   [{cleanup['state']}]"
           + (f"  {cleanup['error']}" if cleanup.get("error") else ""))
     if cleanup["state"] == "poisoned":
         print("    STILL POISONED -- the game is holding the poison value")
+    elif cleanup["state"] == "diverged":
+        print("    the poison is out, but something else owns this property now")
     elif cleanup["state"] == "unknown":
         print("    cleanup could not be read back; whether the poison is out is unknown")
 
@@ -321,6 +373,11 @@ def probe(b: FileBridge, cls: str, prop: str) -> Verdict | None:
         print("POISON STUCK: the check is alive and the write landed, but the")
         print("restore did not take. The game is holding the poison value.")
         return Verdict.POISON_STUCK
+    if cleanup["state"] == "diverged":
+        print("RESTORE UNVERIFIED: the write and the check both verified and the")
+        print("poison is provably out, but the property now holds a third value.")
+        print(f"Something else writes it: observed {cleanup.get('observed')!r}.")
+        return Verdict.RESTORE_UNVERIFIED
     if cleanup["state"] != "restored":
         print("RESTORE UNVERIFIED: everything verified except the cleanup, which")
         print("could not be read back. An unreadable read is not a clean world --")
@@ -448,7 +505,7 @@ def _run_scenario(fake, flags: dict, verbose: bool,
 
 
 def demo(verbose: bool = False) -> int:
-    """Run the verification against four bridges, no game required."""
+    """Run the verification against ten bridges, no game required."""
     try:
         fake = _load_fake_bridge()
     except FileNotFoundError as e:
