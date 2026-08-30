@@ -1,24 +1,14 @@
 """
-Drive the in-game bridge from outside, and verify what it claims.
+Drive the in-game bridge from outside.
 
-This is the piece that turns the spike into a real answer: point it at a running
-game with the GameBridge mod loaded and it will exercise the whole chain, then
-run the negative-control pass over a real write.
+Commands: ping, find, read, bench, and probe. `probe` is the interesting one --
+it runs a write through the full verification and prints each step, so the
+verdict comes with its evidence rather than on its own.
 
-    python drive.py --data "<game>/Binaries/Win64/ue4ss/Mods/GameBridge/data" ping
-    python drive.py --data ... find BP_PlayerCharacter_C
-    python drive.py --data ... probe          # full chain + negative control
+    python drive.py --data "<game>/.../Mods/GameBridge/data" ping
+    python drive.py --data "<game>/.../Mods/GameBridge/data" probe BP_Foo_C --prop Health
 
-The `probe` mode is the one that matters. It:
-  1. finds a live object
-  2. reads a numeric property
-  3. writes a new value, taking the bridge's own claim
-  4. RE-READS through a separate request and compares       <- postcondition
-  5. poisons the check and confirms it goes red             <- negative control
-  6. restores the original value
-
-Step 5 is the part nothing else does, and it is what separates "my check passed"
-from "my check is capable of failing."
+See the README for why the verification looks the way it does.
 """
 
 from __future__ import annotations

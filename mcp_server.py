@@ -1,23 +1,16 @@
 """
-MCP server for a running Unreal Engine game.
+MCP server over the GameBridge.
 
-Exposes the live game to an agent, with one deliberate difference from every
-other "drive the game" tool: the write tool cannot return a bare success.
+Five tools: ping, find_objects, read_property, call_function, write_property.
 
-`write_property` runs the full verification -- an independent re-read, a
-cross-check against the write site's own observation, and a negative control
-that proves the check is capable of failing -- and returns a verdict. When the
-evidence does not support a claim of success, it says so, and it says why.
+write_property returns a verdict rather than a boolean, so a caller cannot
+report a state change it did not make -- the tool will not hand it the words.
+Verification is not read-only; see the tool description and the README.
 
-That is the whole design. An agent calling this tool cannot report a state
-change it did not make, because the tool will not hand it the words.
-
-Run:
     pip install "mcp>=2"
-    python mcp_server.py --data "<game>/Binaries/Win64/ue4ss/Mods/GameBridge/data"
+    python mcp_server.py --data "<game>/.../Mods/GameBridge/data"
 
-Register with a client (Claude Code shown; adapt for others):
-    claude mcp add ue-live -- python /abs/path/mcp_server.py --data "/abs/path/to/data"
+    claude mcp add ue-live -- python /abs/path/mcp_server.py --data "/abs/path/data"
 """
 
 from __future__ import annotations

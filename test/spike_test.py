@@ -1,17 +1,12 @@
 """
-Feasibility spike: does negative-control verification actually catch anything?
+Verification logic, run off-engine against a simulated game that can be told to lie.
 
-Four scenarios, run against a simulated game so the logic is settled before a
-real one is launched:
+Four scenarios: honest bridge, lying bridge, dead check, and both at once. The
+last is the one that matters -- a broken checker against a lying bridge is what
+produces a confident and entirely false pass, and it is what the negative control
+exists to catch.
 
-  1. honest bridge, live check   -> CONFIRMED
-  2. lying bridge,  live check   -> FALSE_SUCCESS      (the published failure mode)
-  3. honest bridge, dead check   -> DEAD_CHECK         (the harness's own failure)
-  4. lying bridge,  dead check   -> DEAD_CHECK, and the money shot: without the
-                                    negative control this scenario emits a
-                                    confident CONFIRMED that is entirely false.
-
-Run:  python test/spike_test.py
+    python test/spike_test.py
 """
 
 from __future__ import annotations
@@ -140,11 +135,7 @@ def main() -> int:
     if failures:
         print(f"FAILED: {len(failures)} check(s): {', '.join(failures)}")
         return 1
-    print("all checks passed\n")
-    print("Conclusion: the negative control catches a class of failure that a")
-    print("postcondition alone cannot -- a broken checker paired with a lying")
-    print("bridge, which is precisely the combination that produces a confident")
-    print("and entirely false CONFIRMED.")
+    print("all checks passed")
     return 0
 
 

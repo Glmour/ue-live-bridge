@@ -1,24 +1,14 @@
 """
 Negative-control verification for agent actions against a live game.
 
-The industry answer to agents falsely claiming success is: assert a postcondition
-against the authoritative record, from a process the agent cannot write to.
+One rule, enforced by the type: a postcondition may not be registered without a
+poison that provably makes it go red, and every postcondition is run against its
+own poison before any verdict from it is trusted. A check that survives its
+poison is reported as a harness failure, not as a passing test.
 
-That is necessary and not sufficient. Nobody checks whether the checker works.
-A postcondition that can never go red is indistinguishable from one that passes,
-and in practice a surprising number of guards are dead on arrival -- they read the
-wrong field, they swallow an exception, they compare a string to an int.
-
-So the rule here is stricter:
-
-    A postcondition may not be registered without a poison that provably makes it
-    go red. Before any verdict is trusted, every postcondition is run against its
-    own poison. A check that survives its poison is a DEAD CHECK and is reported
-    as a harness failure, not as a passing test.
-
-This is the same discipline that came out of shipping game mods, where "the hook
-attached" and "the hook fires" are separate claims and the gap between them
-silently eats days.
+The reasoning is in the README. The short version is that asserting a
+postcondition is necessary and not sufficient, because nobody checks the checker,
+and a guard that can never fail is indistinguishable from one that passes.
 """
 
 from __future__ import annotations
